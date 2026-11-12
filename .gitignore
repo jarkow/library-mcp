@@ -1,8 +1,8 @@
 # Binaries
-library-mcp
-library-mcp.exe
-smart-lib
-smart-lib.exe
+/library-mcp
+/library-mcp.exe
+/smart-lib
+/smart-lib.exe
 *.exe
 *.exe~
 *~
