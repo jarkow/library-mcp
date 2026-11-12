@@ -79,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/ask", s.handleAsk)
 	mux.HandleFunc("/api/ingest", s.handleIngest)
+	mux.HandleFunc("/api/enrich", s.handleEnrich)
 	mux.HandleFunc("/api/upload", s.handleUpload)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/books/delete", s.handleDeleteBook)
@@ -257,9 +258,46 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBooks(w http.ResponseWriter, r *http.Request) {
-	books := s.engine.Store().ListBooks()
+	cat := strings.TrimSpace(r.URL.Query().Get("category"))
+	tag := strings.TrimSpace(r.URL.Query().Get("tag"))
+	books := s.engine.Store().ListBooksFiltered(cat, tag)
+	categories, tags := s.engine.Store().ListCategoriesAndTags()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"books":      books,
+		"categories": categories,
+		"tags":       tags,
+	})
+}
+
+func (s *Server) handleEnrich(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "POST required.")
+		return
+	}
+	var req struct {
+		BookID string `json:"book_id"`
+		Force  bool   `json:"force"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&req)
+
+	if strings.TrimSpace(req.BookID) != "" {
+		rec, err := s.engine.EnrichBook(r.Context(), strings.TrimSpace(req.BookID))
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"book": rec})
+		return
+	}
+
+	books, err := s.engine.EnrichAllBooks(r.Context(), req.Force)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"books": books,
+		"count": len(books),
 	})
 }
 

@@ -16,7 +16,10 @@ import (
 	"strings"
 )
 
-var windowsDriveRe = regexp.MustCompile(`^([a-zA-Z]):[\\/](.*)$`)
+var (
+	windowsDriveRe = regexp.MustCompile(`^([a-zA-Z]):[\\/](.*)$`)
+	wslMountRe     = regexp.MustCompile(`^/mnt/([a-zA-Z])(?:/(.*))?$`)
+)
 
 // Config holds the runtime configuration for Smart Library (Go + Qdrant + Ollama).
 type Config struct {
@@ -35,14 +38,24 @@ type Config struct {
 	Port             int    `json:"port"`
 }
 
-// Default returns a Config populated with safe defaults.
+// Default returns a Config populated with safe cross-platform defaults (Windows, Linux, and WSL).
 func Default() *Config {
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = "."
 	}
+	defaultBooks := `H:\Books`
+	if runtime.GOOS != "windows" {
+		if _, err := os.Stat("/mnt/h/Books"); err == nil {
+			defaultBooks = "/mnt/h/Books"
+		} else if home, err := os.UserHomeDir(); err == nil {
+			defaultBooks = filepath.Join(home, "Books")
+		} else {
+			defaultBooks = "./books"
+		}
+	}
 	return &Config{
-		BooksDir:         `H:\Books`,
+		BooksDir:         defaultBooks,
 		DataDir:          filepath.Join(cwd, "data"),
 		QdrantURL:        "http://127.0.0.1:6333",
 		QdrantCollection: "smart_library_chunks",
@@ -58,7 +71,7 @@ func Default() *Config {
 	}
 }
 
-// TranslatePath converts a user path (including Windows paths like H:\Books on WSL) into a clean OS path.
+// TranslatePath converts a user path (including Windows paths like H:\Books on Linux/WSL, or /mnt/h/Books on Windows) into a clean OS path.
 func TranslatePath(raw string) string {
 	cleaned := strings.TrimSpace(raw)
 	cleaned = strings.Trim(cleaned, `"'`)
@@ -71,10 +84,30 @@ func TranslatePath(raw string) string {
 			drive := strings.ToLower(matches[1])
 			rest := strings.ReplaceAll(matches[2], `\`, "/")
 			rest = strings.TrimLeft(rest, "/")
+			var wslPath string
 			if rest == "" {
-				return filepath.Clean("/mnt/" + drive)
+				wslPath = filepath.Clean("/mnt/" + drive)
+			} else {
+				wslPath = filepath.Clean(filepath.Join("/mnt", drive, rest))
 			}
-			return filepath.Clean(filepath.Join("/mnt", drive, rest))
+			// If /mnt/<drive> exists (WSL), use it; on native Linux without /mnt/<drive>, fall back to $HOME/<rest> if available.
+			if _, err := os.Stat("/mnt/" + drive); err == nil {
+				return wslPath
+			}
+			if home, err := os.UserHomeDir(); err == nil && rest != "" {
+				candidate := filepath.Clean(filepath.Join(home, rest))
+				if _, err := os.Stat(candidate); err == nil {
+					return candidate
+				}
+			}
+			return wslPath
+		}
+		cleaned = strings.ReplaceAll(cleaned, `\`, "/")
+	} else {
+		if matches := wslMountRe.FindStringSubmatch(strings.ReplaceAll(cleaned, `\`, "/")); len(matches) == 3 {
+			drive := strings.ToUpper(matches[1])
+			rest := filepath.FromSlash(matches[2])
+			return filepath.Clean(drive + `:\` + rest)
 		}
 	}
 
@@ -158,11 +191,11 @@ func GetSessionSecret(dataDir string) string {
 	return hex.EncodeToString(buf)
 }
 
-// Load reads Config from disk and applies SMART_LIBRARY_* environment overrides.
+// Load reads Config from disk and applies LIBRARY_MCP_* / SMART_LIBRARY_* environment overrides.
 func Load(configPath string) (*Config, error) {
 	cfg := Default()
 	if configPath == "" {
-		if envPath := os.Getenv("SMART_LIBRARY_CONFIG"); envPath != "" {
+		if envPath := firstEnv("LIBRARY_MCP_CONFIG", "SMART_LIBRARY_CONFIG"); envPath != "" {
 			configPath = envPath
 		} else {
 			configPath = "config.json"
@@ -174,30 +207,30 @@ func Load(configPath string) (*Config, error) {
 			log.Printf("Warning: could not parse %s: %v", configPath, jsonErr)
 		} else if !filepath.IsAbs(cfg.DataDir) {
 			if absCfg, absErr := filepath.Abs(configPath); absErr == nil {
-				cfg.DataDir = filepath.Join(filepath.Dir(absCfg), cfg.DataDir)
+				cfg.DataDir = filepath.Join(filepath.Dir(absCfg), strings.ReplaceAll(cfg.DataDir, `\`, "/"))
 			}
 		}
 	}
 
-	if v := strings.TrimSpace(os.Getenv("SMART_LIBRARY_BOOKS_DIR")); v != "" {
+	if v := firstEnv("LIBRARY_MCP_BOOKS_DIR", "SMART_LIBRARY_BOOKS_DIR"); v != "" {
 		cfg.BooksDir = v
 	}
-	if v := strings.TrimSpace(os.Getenv("SMART_LIBRARY_DATA_DIR")); v != "" {
+	if v := firstEnv("LIBRARY_MCP_DATA_DIR", "SMART_LIBRARY_DATA_DIR"); v != "" {
 		cfg.DataDir = v
 	}
-	if v := strings.TrimSpace(os.Getenv("SMART_LIBRARY_QDRANT_URL")); v != "" {
+	if v := firstEnv("LIBRARY_MCP_QDRANT_URL", "SMART_LIBRARY_QDRANT_URL"); v != "" {
 		cfg.QdrantURL = v
 	}
-	if v := strings.TrimSpace(os.Getenv("SMART_LIBRARY_QDRANT_COLLECTION")); v != "" {
+	if v := firstEnv("LIBRARY_MCP_QDRANT_COLLECTION", "SMART_LIBRARY_QDRANT_COLLECTION"); v != "" {
 		cfg.QdrantCollection = v
 	}
-	if v := strings.TrimSpace(os.Getenv("SMART_LIBRARY_OLLAMA_URL")); v != "" {
+	if v := firstEnv("LIBRARY_MCP_OLLAMA_URL", "SMART_LIBRARY_OLLAMA_URL"); v != "" {
 		cfg.OllamaURL = v
 	}
-	if v := strings.TrimSpace(os.Getenv("SMART_LIBRARY_EMBED_MODEL")); v != "" {
+	if v := firstEnv("LIBRARY_MCP_EMBED_MODEL", "SMART_LIBRARY_EMBED_MODEL"); v != "" {
 		cfg.EmbeddingModel = v
 	}
-	if v := strings.TrimSpace(os.Getenv("SMART_LIBRARY_CHAT_MODEL")); v != "" {
+	if v := firstEnv("LIBRARY_MCP_CHAT_MODEL", "SMART_LIBRARY_CHAT_MODEL"); v != "" {
 		cfg.ChatModel = v
 	}
 	if v := strings.TrimSpace(os.Getenv("SMART_LIBRARY_PARENT_SIZE")); v != "" {
@@ -304,4 +337,13 @@ func (c *Config) Save(configPath string) error {
 		return err
 	}
 	return os.WriteFile(configPath, append(b, '\n'), 0o600)
+}
+
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
 }

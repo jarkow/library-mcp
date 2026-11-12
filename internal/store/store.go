@@ -18,24 +18,34 @@ import (
 	"unicode"
 
 	"library-mcp/internal/epub"
+	"library-mcp/internal/metadata"
 	"library-mcp/internal/qdrant"
 )
 
-// BookRecord stores metadata for an indexed EPUB book.
+// BookRecord stores metadata, category, and tags for an indexed EPUB book.
 type BookRecord struct {
-	ID           string   `json:"id"`
-	FileHash     string   `json:"file_hash"`
-	FileName     string   `json:"file_name"`
-	Title        string   `json:"title"`
-	Author       string   `json:"author"`
-	Publisher    string   `json:"publisher"`
-	Language     string   `json:"language"`
-	Description  string   `json:"description"`
-	Subjects     []string `json:"subjects"`
-	ChapterCount int      `json:"chapter_count"`
-	ParentCount  int      `json:"parent_count"`
-	ChunkCount   int      `json:"chunk_count"`
-	IndexedAt    string   `json:"indexed_at"`
+	ID             string   `json:"id"`
+	FileHash       string   `json:"file_hash"`
+	FileName       string   `json:"file_name"`
+	Title          string   `json:"title"`
+	Subtitle       string   `json:"subtitle,omitempty"`
+	Author         string   `json:"author"`
+	Publisher      string   `json:"publisher"`
+	PublishedYear  string   `json:"published_year,omitempty"`
+	ISBN           string   `json:"isbn,omitempty"`
+	PageCount      int      `json:"page_count,omitempty"`
+	Language       string   `json:"language"`
+	Description    string   `json:"description"`
+	Subjects       []string `json:"subjects"`
+	Category       string   `json:"category"`
+	Tags           []string `json:"tags"`
+	CoverURL       string   `json:"cover_url,omitempty"`
+	WebURL         string   `json:"web_url,omitempty"`
+	MetadataSource string   `json:"metadata_source,omitempty"`
+	ChapterCount   int      `json:"chapter_count"`
+	ParentCount    int      `json:"parent_count"`
+	ChunkCount     int      `json:"chunk_count"`
+	IndexedAt      string   `json:"indexed_at"`
 }
 
 // SearchResult represents a hierarchical retrieval result containing both the matched child chunk and its promoted ParentSection.
@@ -259,19 +269,28 @@ func (s *Store) UpsertBook(ctx context.Context, book *epub.ParsedBook, embedding
 	s.deleteBookLocked(book.ID)
 
 	rec := BookRecord{
-		ID:           book.ID,
-		FileHash:     book.FileHash,
-		FileName:     book.FileName,
-		Title:        book.Title,
-		Author:       book.Author,
-		Publisher:    book.Publisher,
-		Language:     book.Language,
-		Description:  book.Description,
-		Subjects:     book.Subjects,
-		ChapterCount: len(book.Chapters),
-		ParentCount:  len(book.Parents),
-		ChunkCount:   len(book.Chunks),
-		IndexedAt:    time.Now().UTC().Format(time.RFC3339),
+		ID:             book.ID,
+		FileHash:       book.FileHash,
+		FileName:       book.FileName,
+		Title:          book.Title,
+		Subtitle:       book.Subtitle,
+		Author:         book.Author,
+		Publisher:      book.Publisher,
+		PublishedYear:  book.PublishedYear,
+		ISBN:           book.ISBN,
+		PageCount:      book.PageCount,
+		Language:       book.Language,
+		Description:    book.Description,
+		Subjects:       book.Subjects,
+		Category:       book.Category,
+		Tags:           book.Tags,
+		CoverURL:       book.CoverURL,
+		WebURL:         book.WebURL,
+		MetadataSource: book.MetadataSource,
+		ChapterCount:   len(book.Chapters),
+		ParentCount:    len(book.Parents),
+		ChunkCount:     len(book.Chunks),
+		IndexedAt:      time.Now().UTC().Format(time.RFC3339),
 	}
 	s.books[book.ID] = rec
 
@@ -357,17 +376,134 @@ func (s *Store) deleteBookLocked(bookID string) {
 
 // ListBooks returns all indexed books sorted alphabetically by title.
 func (s *Store) ListBooks() []BookRecord {
+	return s.ListBooksFiltered("", "")
+}
+
+// ListBooksFiltered returns indexed books filtered by optional category and/or tag.
+func (s *Store) ListBooksFiltered(category, tag string) []BookRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	catFilter := strings.ToLower(strings.TrimSpace(category))
+	tagFilter := strings.ToLower(strings.TrimSpace(tag))
+
 	out := make([]BookRecord, 0, len(s.books))
 	for _, b := range s.books {
+		if catFilter != "" && !strings.Contains(strings.ToLower(b.Category), catFilter) {
+			continue
+		}
+		if tagFilter != "" {
+			matchedTag := false
+			for _, t := range b.Tags {
+				if strings.EqualFold(t, tagFilter) || strings.Contains(strings.ToLower(t), tagFilter) {
+					matchedTag = true
+					break
+				}
+			}
+			if !matchedTag {
+				continue
+			}
+		}
 		out = append(out, b)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return strings.ToLower(out[i].Title) < strings.ToLower(out[j].Title)
 	})
 	return out
+}
+
+// ListCategoriesAndTags returns sorted unique categories and tags across all indexed books.
+func (s *Store) ListCategoriesAndTags() ([]string, []string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	catSet := make(map[string]bool)
+	tagSet := make(map[string]bool)
+	for _, b := range s.books {
+		if strings.TrimSpace(b.Category) != "" {
+			catSet[b.Category] = true
+		}
+		for _, t := range b.Tags {
+			if strings.TrimSpace(t) != "" {
+				tagSet[t] = true
+			}
+		}
+	}
+
+	cats := make([]string, 0, len(catSet))
+	for c := range catSet {
+		cats = append(cats, c)
+	}
+	sort.Strings(cats)
+
+	tags := make([]string, 0, len(tagSet))
+	for t := range tagSet {
+		tags = append(tags, t)
+	}
+	sort.Strings(tags)
+	return cats, tags
+}
+
+// UpdateBookMetadata updates a book's bibliographic metadata, category, and tags and persists the catalog.
+func (s *Store) UpdateBookMetadata(bookID string, meta metadata.BookMetadata) (BookRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, ok := s.books[bookID]
+	if !ok {
+		return BookRecord{}, errors.New("book not found")
+	}
+	if meta.Title != "" {
+		rec.Title = meta.Title
+	}
+	if meta.Subtitle != "" {
+		rec.Subtitle = meta.Subtitle
+	}
+	if meta.Author != "" {
+		rec.Author = meta.Author
+	}
+	if meta.Publisher != "" {
+		rec.Publisher = meta.Publisher
+	}
+	if meta.PublishedYear != "" {
+		rec.PublishedYear = meta.PublishedYear
+	}
+	if meta.ISBN != "" {
+		rec.ISBN = meta.ISBN
+	}
+	if meta.PageCount > 0 {
+		rec.PageCount = meta.PageCount
+	}
+	if meta.Language != "" {
+		rec.Language = meta.Language
+	}
+	if meta.Description != "" {
+		rec.Description = meta.Description
+	}
+	if len(meta.Subjects) > 0 {
+		rec.Subjects = meta.Subjects
+	}
+	if meta.Category != "" {
+		rec.Category = meta.Category
+	}
+	if len(meta.Tags) > 0 {
+		rec.Tags = meta.Tags
+	}
+	if meta.CoverURL != "" {
+		rec.CoverURL = meta.CoverURL
+	}
+	if meta.WebURL != "" {
+		rec.WebURL = meta.WebURL
+	}
+	if meta.MetadataSource != "" {
+		rec.MetadataSource = meta.MetadataSource
+	}
+
+	s.books[bookID] = rec
+	if err := s.saveLocked(); err != nil {
+		return rec, err
+	}
+	return rec, nil
 }
 
 // GetBook returns a book record and its ordered chapters (without full content for fast listing).
@@ -603,9 +739,28 @@ func (s *Store) buildFilterMaskLocked(bookFilter string) []bool {
 	if filter == "" {
 		return nil
 	}
+	matchingBooks := make(map[string]bool)
+	for id, b := range s.books {
+		if strings.ToLower(id) == filter ||
+			strings.Contains(strings.ToLower(b.Title), filter) ||
+			strings.Contains(strings.ToLower(b.Author), filter) ||
+			strings.Contains(strings.ToLower(b.Category), filter) ||
+			strings.EqualFold(b.ISBN, filter) {
+			matchingBooks[id] = true
+			continue
+		}
+		for _, t := range b.Tags {
+			if strings.EqualFold(t, filter) || strings.Contains(strings.ToLower(t), filter) {
+				matchingBooks[id] = true
+				break
+			}
+		}
+	}
+
 	mask := make([]bool, len(s.chunks))
 	for i, ck := range s.chunks {
-		if strings.ToLower(ck.BookID) == filter ||
+		if matchingBooks[ck.BookID] ||
+			strings.ToLower(ck.BookID) == filter ||
 			strings.Contains(strings.ToLower(ck.BookTitle), filter) ||
 			strings.Contains(strings.ToLower(ck.Author), filter) {
 			mask[i] = true

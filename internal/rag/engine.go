@@ -13,6 +13,7 @@ import (
 
 	"library-mcp/internal/config"
 	"library-mcp/internal/epub"
+	"library-mcp/internal/metadata"
 	"library-mcp/internal/ollama"
 	"library-mcp/internal/qdrant"
 	"library-mcp/internal/store"
@@ -20,14 +21,15 @@ import (
 
 // IngestReport summarizes a batch or single-file ingestion run.
 type IngestReport struct {
-	ScannedFiles int      `json:"scanned_files"`
-	IndexedBooks int      `json:"indexed_books"`
-	SkippedBooks int      `json:"skipped_books"`
-	TotalParents int      `json:"total_parents"`
-	TotalChunks  int      `json:"total_chunks"`
-	Embedded     bool     `json:"embedded"`
-	Errors       []string `json:"errors"`
-	DurationMs   int64    `json:"duration_ms"`
+	ScannedFiles int                `json:"scanned_files"`
+	IndexedBooks int                `json:"indexed_books"`
+	SkippedBooks int                `json:"skipped_books"`
+	TotalParents int                `json:"total_parents"`
+	TotalChunks  int                `json:"total_chunks"`
+	Embedded     bool               `json:"embedded"`
+	Books        []store.BookRecord `json:"books,omitempty"`
+	Errors       []string           `json:"errors"`
+	DurationMs   int64              `json:"duration_ms"`
 }
 
 // AskResponse holds the grounded LLM response and its Parent-Child source citations.
@@ -39,13 +41,14 @@ type AskResponse struct {
 	DurationMs int64                `json:"duration_ms"`
 }
 
-// Engine coordinates EPUB ingestion, Qdrant hybrid retrieval, Parent-Child promotion, and Ollama generation.
+// Engine coordinates EPUB ingestion, web metadata enrichment, Qdrant hybrid retrieval, Parent-Child promotion, and Ollama generation.
 type Engine struct {
-	mu     sync.RWMutex
-	cfg    *config.Config
-	store  *store.Store
-	ollama *ollama.Client
-	qdrant *qdrant.Client
+	mu       sync.RWMutex
+	cfg      *config.Config
+	store    *store.Store
+	ollama   *ollama.Client
+	qdrant   *qdrant.Client
+	enricher *metadata.Enricher
 }
 
 // NewEngine creates a new RAG Engine for the given configuration and store.
@@ -53,10 +56,11 @@ func NewEngine(cfg *config.Config, st *store.Store) *Engine {
 	qc := qdrant.NewClient(cfg.QdrantURL, cfg.QdrantCollection)
 	st.SetQdrantClient(qc)
 	return &Engine{
-		cfg:    cfg,
-		store:  st,
-		ollama: ollama.NewClient(cfg.OllamaURL),
-		qdrant: qc,
+		cfg:      cfg,
+		store:    st,
+		ollama:   ollama.NewClient(cfg.OllamaURL),
+		qdrant:   qc,
+		enricher: metadata.NewEnricher(),
 	}
 }
 
@@ -156,11 +160,18 @@ func (e *Engine) IngestDir(ctx context.Context, dirPath string, force bool, prog
 		}
 	}
 
+	// Ensure any existing books lacking web metadata/category/tags are also enriched
+	if enrichedBooks, err := e.EnrichAllBooks(ctx, false); err == nil {
+		report.Books = enrichedBooks
+	} else {
+		report.Books = e.store.ListBooks()
+	}
+
 	report.DurationMs = time.Since(start).Milliseconds()
 	return report, nil
 }
 
-// IngestFile parses and indexes a single EPUB file verified to reside inside allowedBaseDir.
+// IngestFile parses, enriches web metadata & tags/category, and indexes a single EPUB file verified to reside inside allowedBaseDir.
 func (e *Engine) IngestFile(ctx context.Context, filePath, allowedBaseDir string, force bool) (bool, int, int, bool, error) {
 	if allowedBaseDir != "" && !config.IsSafeSubpath(filePath, allowedBaseDir) {
 		return false, 0, 0, false, fmt.Errorf("security violation: path outside allowed directory boundary")
@@ -184,12 +195,113 @@ func (e *Engine) IngestFile(ctx context.Context, filePath, allowedBaseDir string
 		return false, 0, 0, false, fmt.Errorf("no readable text chunks found in EPUB")
 	}
 
+	e.enrichParsedBook(ctx, parsed)
+
 	embeddings, embeddedOK := e.embedChunksWithBatching(ctx, parsed.Chunks)
 	if err := e.store.UpsertBook(ctx, parsed, embeddings); err != nil {
 		return false, 0, 0, false, err
 	}
 
 	return true, len(parsed.Parents), len(parsed.Chunks), embeddedOK, nil
+}
+
+func (e *Engine) enrichParsedBook(ctx context.Context, parsed *epub.ParsedBook) {
+	if e.enricher == nil || parsed == nil {
+		return
+	}
+	chapTitles := make([]string, 0, len(parsed.Chapters))
+	for _, ch := range parsed.Chapters {
+		chapTitles = append(chapTitles, ch.Title)
+	}
+	seed := metadata.BookMetadata{
+		Title:         parsed.Title,
+		Subtitle:      parsed.Subtitle,
+		Author:        parsed.Author,
+		Publisher:     parsed.Publisher,
+		PublishedYear: parsed.PublishedYear,
+		ISBN:          parsed.ISBN,
+		Language:      parsed.Language,
+		Description:   parsed.Description,
+		Subjects:      parsed.Subjects,
+	}
+	enriched := e.enricher.Enrich(ctx, seed, chapTitles)
+	if enriched.Title != "" {
+		parsed.Title = enriched.Title
+	}
+	parsed.Subtitle = enriched.Subtitle
+	if enriched.Author != "" {
+		parsed.Author = enriched.Author
+	}
+	if enriched.Publisher != "" {
+		parsed.Publisher = enriched.Publisher
+	}
+	if enriched.PublishedYear != "" {
+		parsed.PublishedYear = enriched.PublishedYear
+	}
+	if enriched.ISBN != "" {
+		parsed.ISBN = enriched.ISBN
+	}
+	if enriched.PageCount > 0 {
+		parsed.PageCount = enriched.PageCount
+	}
+	if enriched.Language != "" {
+		parsed.Language = enriched.Language
+	}
+	if enriched.Description != "" {
+		parsed.Description = enriched.Description
+	}
+	if len(enriched.Subjects) > 0 {
+		parsed.Subjects = enriched.Subjects
+	}
+	parsed.Category = enriched.Category
+	parsed.Tags = enriched.Tags
+	parsed.CoverURL = enriched.CoverURL
+	parsed.WebURL = enriched.WebURL
+	parsed.MetadataSource = enriched.MetadataSource
+}
+
+// EnrichBook fetches web metadata (Google Books + Open Library) and categorizes/tags a single indexed book by ID.
+func (e *Engine) EnrichBook(ctx context.Context, bookID string) (store.BookRecord, error) {
+	rec, chaps, ok := e.store.GetBook(bookID)
+	if !ok {
+		return store.BookRecord{}, fmt.Errorf("book %q not found", bookID)
+	}
+	chapTitles := make([]string, 0, len(chaps))
+	for _, ch := range chaps {
+		chapTitles = append(chapTitles, ch.Title)
+	}
+	seed := metadata.BookMetadata{
+		Title:          rec.Title,
+		Subtitle:       rec.Subtitle,
+		Author:         rec.Author,
+		Publisher:      rec.Publisher,
+		PublishedYear:  rec.PublishedYear,
+		ISBN:           rec.ISBN,
+		PageCount:      rec.PageCount,
+		Language:       rec.Language,
+		Description:    rec.Description,
+		Subjects:       rec.Subjects,
+		CoverURL:       rec.CoverURL,
+		WebURL:         rec.WebURL,
+		MetadataSource: rec.MetadataSource,
+	}
+	enriched := e.enricher.Enrich(ctx, seed, chapTitles)
+	return e.store.UpdateBookMetadata(bookID, enriched)
+}
+
+// EnrichAllBooks enriches all indexed books (or only those missing web metadata/category/tags when force is false).
+func (e *Engine) EnrichAllBooks(ctx context.Context, force bool) ([]store.BookRecord, error) {
+	books := e.store.ListBooks()
+	for _, b := range books {
+		needsEnrich := force || b.Category == "" || len(b.Tags) == 0 || b.MetadataSource == "" || b.MetadataSource == "epub"
+		if !needsEnrich {
+			continue
+		}
+		if _, err := e.EnrichBook(ctx, b.ID); err != nil {
+			log.Printf("Warning: could not enrich book %s (%s): %v", b.ID, b.Title, err)
+		}
+	}
+	return e.store.ListBooks(), nil
 }
 
 func (e *Engine) embedChunksWithBatching(ctx context.Context, chunks []epub.ParsedChunk) ([][]float32, bool) {

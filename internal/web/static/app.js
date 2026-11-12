@@ -115,8 +115,20 @@
       const meta = el(
         "div",
         "book-card-meta",
-        b.author + " • " + b.chapter_count + " ch • " + b.parent_count + " sections • " + b.chunk_count + " chunks"
+        b.author +
+          (b.published_year ? " (" + b.published_year + ")" : "") +
+          (b.category ? " • [" + b.category + "]" : "") +
+          " • " +
+          b.chapter_count +
+          " ch • " +
+          b.parent_count +
+          " sections"
       );
+
+      let tagsRow = null;
+      if (b.tags && b.tags.length > 0) {
+        tagsRow = el("div", "book-card-meta", "Tags: #" + b.tags.slice(0, 5).join(" #"));
+      }
 
       const actions = el("div", "book-card-actions");
       const readBtn = el("button", "btn btn-small btn-secondary", "Browse Chapters");
@@ -136,6 +148,7 @@
 
       card.appendChild(title);
       card.appendChild(meta);
+      if (tagsRow) card.appendChild(tagsRow);
       card.appendChild(actions);
       container.appendChild(card);
     });
@@ -426,6 +439,27 @@
         e.target.value = "";
       }
     });
+
+    const enrichBtn = document.getElementById("btn-enrich");
+    if (enrichBtn) {
+      enrichBtn.addEventListener("click", async function () {
+        enrichBtn.disabled = true;
+        enrichBtn.textContent = "Enriching...";
+        try {
+          const res = await apiFetch("/api/enrich", {
+            method: "POST",
+            body: JSON.stringify({ force: true }),
+          });
+          showToast("Enriched metadata, categories & tags for " + (res.count || 0) + " books.");
+          await refreshStatusAndBooks();
+        } catch (err) {
+          showToast("Metadata enrich failed: " + err.message);
+        } finally {
+          enrichBtn.disabled = false;
+          enrichBtn.textContent = "Enrich Metadata";
+        }
+      });
+    }
 
     const modal = document.getElementById("settings-modal");
     document.getElementById("btn-settings").addEventListener("click", function () {

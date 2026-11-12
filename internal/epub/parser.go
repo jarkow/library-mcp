@@ -24,18 +24,27 @@ const (
 
 // ParsedBook represents an extracted EPUB book with chapters, parent sections, and child search chunks.
 type ParsedBook struct {
-	ID          string          `json:"id"`
-	FileHash    string          `json:"file_hash"`
-	FileName    string          `json:"file_name"`
-	Title       string          `json:"title"`
-	Author      string          `json:"author"`
-	Publisher   string          `json:"publisher"`
-	Language    string          `json:"language"`
-	Description string          `json:"description"`
-	Subjects    []string        `json:"subjects"`
-	Chapters    []ParsedChapter `json:"chapters"`
-	Parents     []ParentSection `json:"parents"`
-	Chunks      []ParsedChunk   `json:"chunks"`
+	ID             string          `json:"id"`
+	FileHash       string          `json:"file_hash"`
+	FileName       string          `json:"file_name"`
+	Title          string          `json:"title"`
+	Subtitle       string          `json:"subtitle,omitempty"`
+	Author         string          `json:"author"`
+	Publisher      string          `json:"publisher"`
+	PublishedYear  string          `json:"published_year,omitempty"`
+	ISBN           string          `json:"isbn,omitempty"`
+	PageCount      int             `json:"page_count,omitempty"`
+	Language       string          `json:"language"`
+	Description    string          `json:"description"`
+	Subjects       []string        `json:"subjects"`
+	Category       string          `json:"category,omitempty"`
+	Tags           []string        `json:"tags,omitempty"`
+	CoverURL       string          `json:"cover_url,omitempty"`
+	WebURL         string          `json:"web_url,omitempty"`
+	MetadataSource string          `json:"metadata_source,omitempty"`
+	Chapters       []ParsedChapter `json:"chapters"`
+	Parents        []ParentSection `json:"parents"`
+	Chunks         []ParsedChunk   `json:"chunks"`
 }
 
 // ParsedChapter represents a full chapter in the book spine.
@@ -89,6 +98,8 @@ type opfPackage struct {
 		Title       []string `xml:"title"`
 		Creator     []string `xml:"creator"`
 		Publisher   []string `xml:"publisher"`
+		Date        []string `xml:"date"`
+		Identifier  []string `xml:"identifier"`
 		Language    []string `xml:"language"`
 		Description []string `xml:"description"`
 		Subject     []string `xml:"subject"`
@@ -139,6 +150,8 @@ var (
 	multiSpaceRe  = regexp.MustCompile(`[ \t]+`)
 	multiNewline  = regexp.MustCompile(`\n{3,}`)
 	xxeEntityRe   = regexp.MustCompile(`(?is)<!ENTITY\b`)
+	isbnTextRe    = regexp.MustCompile(`(?i)ISBN(?:-1[03])?[:\s]*([0-9]{3}[-\s]?[0-9]{1,5}[-\s]?[0-9]{1,7}[-\s]?[0-9]{1,6}[-\s]?[0-9Xx]|[0-9]{9}[0-9Xx])`)
+	yearTextRe    = regexp.MustCompile(`\b(19\d{2}|20\d{2})\b`)
 )
 
 // DeterministicUUID generates an RFC-4122 v5-like UUID string from an arbitrary string ID for Qdrant point IDs.
@@ -263,6 +276,8 @@ func ParseFile(filePath string, parentSize, childSize, childOverlap int) (*Parse
 	language := firstNonEmpty(pkg.Metadata.Language, "en")
 	description := stripHTMLTags(firstNonEmpty(pkg.Metadata.Description, ""))
 	subjects := cleanSlice(pkg.Metadata.Subject)
+	publishedYear := extractYear(pkg.Metadata.Date)
+	isbn := extractISBN(pkg.Metadata.Identifier)
 
 	manifestByID := make(map[string]opfManifestItem, len(pkg.Manifest.Items))
 	var navHref, ncxHref string
@@ -336,19 +351,33 @@ func ParseFile(filePath string, parentSize, childSize, childOverlap int) (*Parse
 		allChunks = append(allChunks, children...)
 	}
 
+	if isbn == "" {
+		for i := 0; i < len(chapters) && i < 4; i++ {
+			if m := isbnTextRe.FindStringSubmatch(chapters[i].Content); len(m) >= 2 {
+				cand := strings.NewReplacer("-", "", " ", "").Replace(m[1])
+				if len(cand) == 10 || len(cand) == 13 {
+					isbn = strings.ToUpper(cand)
+					break
+				}
+			}
+		}
+	}
+
 	return &ParsedBook{
-		ID:          bookID,
-		FileHash:    fileHash,
-		FileName:    filepath.Base(filePath),
-		Title:       title,
-		Author:      author,
-		Publisher:   publisher,
-		Language:    language,
-		Description: description,
-		Subjects:    subjects,
-		Chapters:    chapters,
-		Parents:     allParents,
-		Chunks:      allChunks,
+		ID:            bookID,
+		FileHash:      fileHash,
+		FileName:      filepath.Base(filePath),
+		Title:         title,
+		Author:        author,
+		Publisher:     publisher,
+		PublishedYear: publishedYear,
+		ISBN:          isbn,
+		Language:      language,
+		Description:   description,
+		Subjects:      subjects,
+		Chapters:      chapters,
+		Parents:       allParents,
+		Chunks:        allChunks,
 	}, nil
 }
 
@@ -812,4 +841,32 @@ func cleanSlice(items []string) []string {
 		}
 	}
 	return out
+}
+
+func extractYear(dates []string) string {
+	for _, d := range dates {
+		if m := yearTextRe.FindString(d); m != "" {
+			return m
+		}
+	}
+	return ""
+}
+
+func extractISBN(identifiers []string) string {
+	for _, id := range identifiers {
+		cleaned := strings.NewReplacer("-", "", " ", "", "urn:isbn:", "", "URN:ISBN:", "").Replace(strings.TrimSpace(id))
+		if len(cleaned) == 13 || len(cleaned) == 10 {
+			valid := true
+			for i, r := range cleaned {
+				if (r < '0' || r > '9') && !(i == 9 && (r == 'X' || r == 'x')) {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				return strings.ToUpper(cleaned)
+			}
+		}
+	}
+	return ""
 }

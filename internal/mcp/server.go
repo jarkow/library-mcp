@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"library-mcp/internal/rag"
+	"library-mcp/internal/store"
 )
 
 type rpcRequest struct {
@@ -84,7 +85,7 @@ func (s *Server) handleRequest(ctx context.Context, req rpcRequest) rpcResponse 
 				},
 				"serverInfo": map[string]any{
 					"name":    "library-mcp",
-					"version": "1.0.0",
+					"version": "1.1.0",
 				},
 			},
 		}
@@ -97,7 +98,7 @@ func (s *Server) handleRequest(ctx context.Context, req rpcRequest) rpcResponse 
 				"tools": []map[string]any{
 					{
 						"name":        "search_books",
-						"description": "Search the user's technical EPUB library using Qdrant Hybrid Search (Dense + Sparse RRF) and Parent-Child Hierarchical Retrieval.",
+						"description": "Search the user's technical EPUB library using Qdrant Hybrid Search (Dense + Sparse RRF) and Parent-Child Hierarchical Retrieval. Supports filtering by book title/author/ID, category, or tag.",
 						"inputSchema": map[string]any{
 							"type": "object",
 							"properties": map[string]any{
@@ -107,7 +108,15 @@ func (s *Server) handleRequest(ctx context.Context, req rpcRequest) rpcResponse 
 								},
 								"book_filter": map[string]any{
 									"type":        "string",
-									"description": "Optional book title, author, or book ID filter.",
+									"description": "Optional book title, author, book ID, category, or tag filter.",
+								},
+								"category": map[string]any{
+									"type":        "string",
+									"description": "Optional category filter (e.g. 'AI & Machine Learning', 'Security & Cryptography').",
+								},
+								"tag": map[string]any{
+									"type":        "string",
+									"description": "Optional tag filter (e.g. 'rag', 'xss', 'domain-driven-design').",
 								},
 								"top_k": map[string]any{
 									"type":        "integer",
@@ -119,10 +128,19 @@ func (s *Server) handleRequest(ctx context.Context, req rpcRequest) rpcResponse 
 					},
 					{
 						"name":        "list_books",
-						"description": "List all technical EPUB books currently indexed in the Smart Library.",
+						"description": "List all technical EPUB books currently indexed in Library MCP with their web metadata, category, and tags. Supports optional category and tag filters.",
 						"inputSchema": map[string]any{
-							"type":       "object",
-							"properties": map[string]any{},
+							"type": "object",
+							"properties": map[string]any{
+								"category": map[string]any{
+									"type":        "string",
+									"description": "Optional category substring filter.",
+								},
+								"tag": map[string]any{
+									"type":        "string",
+									"description": "Optional tag filter.",
+								},
+							},
 						},
 					},
 					{
@@ -137,6 +155,23 @@ func (s *Server) handleRequest(ctx context.Context, req rpcRequest) rpcResponse 
 								},
 							},
 							"required": []string{"chapter_id"},
+						},
+					},
+					{
+						"name":        "enrich_books",
+						"description": "Fetch bibliographic metadata from the web (Google Books & Open Library) and automatically categorize and tag indexed books.",
+						"inputSchema": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"book_id": map[string]any{
+									"type":        "string",
+									"description": "Optional book ID to enrich. If omitted, enriches all indexed books.",
+								},
+								"force": map[string]any{
+									"type":        "boolean",
+									"description": "Force re-fetching web metadata even if already enriched.",
+								},
+							},
 						},
 					},
 				},
@@ -187,6 +222,12 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 			return "Error: 'query' parameter is required.", true
 		}
 		bookFilter, _ := args["book_filter"].(string)
+		if cat, _ := args["category"].(string); strings.TrimSpace(cat) != "" && bookFilter == "" {
+			bookFilter = cat
+		}
+		if tag, _ := args["tag"].(string); strings.TrimSpace(tag) != "" && bookFilter == "" {
+			bookFilter = tag
+		}
 		topK := 5
 		if kFloat, ok := args["top_k"].(float64); ok && int(kFloat) > 0 {
 			topK = int(kFloat)
@@ -204,25 +245,26 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 			if parentContent == "" {
 				parentContent = ck.Text
 			}
+			bookRec, _, hasBook := s.engine.Store().GetBook(ck.BookID)
+			catTagLine := ""
+			if hasBook && (bookRec.Category != "" || len(bookRec.Tags) > 0) {
+				catTagLine = fmt.Sprintf("**Category:** %s | **Tags:** `%s`\n", bookRec.Category, strings.Join(bookRec.Tags, "`, `"))
+			}
 			sb.WriteString(fmt.Sprintf(
-				"### Result %d (Score: %.4f | Child Hits: %d | Chapter ID: %s | Parent ID: %s)\n**Book:** %s (%s)\n**Chapter:** %s > %s\n\n%s\n\n---\n\n",
-				i+1, res.Score, res.ChildHits, ck.ChapterID, res.ParentID, ck.BookTitle, ck.Author, ck.ChapterTitle, ck.SectionTitle, parentContent,
+				"### Result %d (Score: %.4f | Child Hits: %d | Chapter ID: %s | Parent ID: %s)\n**Book:** %s (%s)\n%s**Chapter:** %s > %s\n\n%s\n\n---\n\n",
+				i+1, res.Score, res.ChildHits, ck.ChapterID, res.ParentID, ck.BookTitle, ck.Author, catTagLine, ck.ChapterTitle, ck.SectionTitle, parentContent,
 			))
 		}
 		return sb.String(), false
 
 	case "list_books":
-		books := s.engine.Store().ListBooks()
+		catFilter, _ := args["category"].(string)
+		tagFilter, _ := args["tag"].(string)
+		books := s.engine.Store().ListBooksFiltered(catFilter, tagFilter)
 		if len(books) == 0 {
-			return "No books are currently indexed in Smart Library.", false
+			return "No matching books are currently indexed in Library MCP.", false
 		}
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("Indexed Technical Books (%d):\n\n", len(books)))
-		for _, b := range books {
-			sb.WriteString(fmt.Sprintf("- **%s** by %s (`id`: `%s`, %d chapters, %d parent sections, %d child chunks)\n",
-				b.Title, b.Author, b.ID, b.ChapterCount, b.ParentCount, b.ChunkCount))
-		}
-		return sb.String(), false
+		return formatBooksList(books), false
 
 	case "get_chapter":
 		chapID, _ := args["chapter_id"].(string)
@@ -232,7 +274,66 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		}
 		return fmt.Sprintf("# %s (Chapter ID: %s)\n\n%s", chap.Title, chap.ID, chap.Content), false
 
+	case "enrich_books":
+		bookID, _ := args["book_id"].(string)
+		force, _ := args["force"].(bool)
+		if strings.TrimSpace(bookID) != "" {
+			rec, err := s.engine.EnrichBook(ctx, strings.TrimSpace(bookID))
+			if err != nil {
+				return fmt.Sprintf("Error enriching book %q: %v", bookID, err), true
+			}
+			return formatBooksList([]store.BookRecord{rec}), false
+		}
+		books, err := s.engine.EnrichAllBooks(ctx, force)
+		if err != nil {
+			return fmt.Sprintf("Error enriching books: %v", err), true
+		}
+		return formatBooksList(books), false
+
 	default:
 		return fmt.Sprintf("Unknown tool: %s", name), true
 	}
+}
+
+func formatBooksList(books []store.BookRecord) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Indexed Technical Books (%d):\n\n", len(books)))
+	for _, b := range books {
+		titleLine := fmt.Sprintf("- **%s**", b.Title)
+		if b.Subtitle != "" {
+			titleLine += fmt.Sprintf(": *%s*", b.Subtitle)
+		}
+		titleLine += fmt.Sprintf(" by %s (`id`: `%s`)\n", b.Author, b.ID)
+		sb.WriteString(titleLine)
+
+		category := b.Category
+		if category == "" {
+			category = "Uncategorized"
+		}
+		tagsStr := "none"
+		if len(b.Tags) > 0 {
+			tagsStr = "`" + strings.Join(b.Tags, "`, `") + "`"
+		}
+		sb.WriteString(fmt.Sprintf("  - **Category:** %s | **Tags:** %s\n", category, tagsStr))
+
+		var bibParts []string
+		if b.Publisher != "" {
+			bibParts = append(bibParts, "Publisher: "+b.Publisher)
+		}
+		if b.PublishedYear != "" {
+			bibParts = append(bibParts, "Year: "+b.PublishedYear)
+		}
+		if b.ISBN != "" {
+			bibParts = append(bibParts, "ISBN: "+b.ISBN)
+		}
+		if b.MetadataSource != "" {
+			bibParts = append(bibParts, "Source: "+b.MetadataSource)
+		}
+		if len(bibParts) > 0 {
+			sb.WriteString(fmt.Sprintf("  - **Metadata:** %s\n", strings.Join(bibParts, " | ")))
+		}
+		sb.WriteString(fmt.Sprintf("  - **Structure:** %d chapters, %d parent sections, %d child chunks\n",
+			b.ChapterCount, b.ParentCount, b.ChunkCount))
+	}
+	return sb.String()
 }
