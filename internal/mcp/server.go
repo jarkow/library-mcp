@@ -174,6 +174,20 @@ func (s *Server) handleRequest(ctx context.Context, req rpcRequest) rpcResponse 
 							},
 						},
 					},
+					{
+						"name":        "remove_book",
+						"description": "Remove an indexed book (and all its chapters, parent sections, and chunks) from Library MCP by book ID, title, ISBN, or filename.",
+						"inputSchema": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"book_id": map[string]any{
+									"type":        "string",
+									"description": "Book ID, title, ISBN, or filename of the book to remove.",
+								},
+							},
+							"required": []string{"book_id"},
+						},
+					},
 				},
 			},
 		}
@@ -289,6 +303,18 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 			return fmt.Sprintf("Error enriching books: %v", err), true
 		}
 		return formatBooksList(books), false
+
+	case "remove_book":
+		target, _ := args["book_id"].(string)
+		if strings.TrimSpace(target) == "" {
+			return "Error: 'book_id' parameter is required.", true
+		}
+		removed, err := s.engine.Store().RemoveBook(ctx, target)
+		if err != nil {
+			return fmt.Sprintf("Error removing book: %v", err), true
+		}
+		return fmt.Sprintf("Removed book **%s** by %s (`id`: `%s`, %d chapters, %d parent sections, %d child chunks).",
+			removed.Title, removed.Author, removed.ID, removed.ChapterCount, removed.ParentCount, removed.ChunkCount), false
 
 	default:
 		return fmt.Sprintf("Unknown tool: %s", name), true

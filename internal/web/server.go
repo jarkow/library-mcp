@@ -574,11 +574,15 @@ func (s *Server) handleDeleteBook(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "Missing book_id.")
 		return
 	}
-	if err := s.engine.Store().DeleteBook(r.Context(), strings.TrimSpace(req.BookID)); err != nil {
-		writeJSONError(w, http.StatusNotFound, "Book not found.")
+	removed, err := s.engine.Store().RemoveBook(r.Context(), strings.TrimSpace(req.BookID))
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"deleted": true,
+		"book":    removed,
+	})
 }
 
 func (s *Server) handleQdrantSync(w http.ResponseWriter, r *http.Request) {

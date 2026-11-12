@@ -94,4 +94,15 @@ func TestParentChildPromotionAndHybridFallback(t *testing.T) {
 	if results[0].ParentText != book.Parents[0].Content {
 		t.Errorf("expected promoted ParentText to match full ParentSection content")
 	}
+
+	removed, err := st.RemoveBook(context.Background(), "Designing Data-Intensive")
+	if err != nil {
+		t.Fatalf("RemoveBook by title substring failed: %v", err)
+	}
+	if removed.ID != "book01" {
+		t.Errorf("expected removed book ID 'book01', got %q", removed.ID)
+	}
+	if len(st.ListBooks()) != 0 {
+		t.Errorf("expected 0 books after RemoveBook, got %d", len(st.ListBooks()))
+	}
 }

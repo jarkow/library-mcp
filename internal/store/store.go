@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -325,24 +326,76 @@ func (s *Store) SyncAllToQdrant(ctx context.Context) error {
 
 // DeleteBook removes a book from Qdrant and the local catalog by ID.
 func (s *Store) DeleteBook(ctx context.Context, bookID string) error {
+	_, err := s.RemoveBook(ctx, bookID)
+	return err
+}
+
+// RemoveBook resolves a book by exact ID, ISBN, exact title/filename, or unique title substring and removes it from Qdrant and the local catalog.
+func (s *Store) RemoveBook(ctx context.Context, idOrQuery string) (BookRecord, error) {
+	q := strings.TrimSpace(idOrQuery)
+	if q == "" {
+		return BookRecord{}, errors.New("book ID or title is required")
+	}
+
 	s.mu.RLock()
 	qc := s.qdrant
-	_, exists := s.books[bookID]
+	var matched BookRecord
+	found := false
+
+	if rec, ok := s.books[q]; ok {
+		matched = rec
+		found = true
+	} else {
+		lowerQ := strings.ToLower(q)
+		for _, b := range s.books {
+			if strings.EqualFold(b.ID, q) ||
+				strings.EqualFold(b.Title, q) ||
+				strings.EqualFold(b.FileName, q) ||
+				(b.ISBN != "" && strings.EqualFold(b.ISBN, q)) {
+				matched = b
+				found = true
+				break
+			}
+		}
+		if !found {
+			var candidates []BookRecord
+			for _, b := range s.books {
+				if strings.Contains(strings.ToLower(b.Title), lowerQ) ||
+					strings.Contains(strings.ToLower(b.FileName), lowerQ) {
+					candidates = append(candidates, b)
+				}
+			}
+			if len(candidates) == 1 {
+				matched = candidates[0]
+				found = true
+			} else if len(candidates) > 1 {
+				s.mu.RUnlock()
+				var names []string
+				for _, c := range candidates {
+					names = append(names, fmt.Sprintf("%s (%s)", c.Title, c.ID))
+				}
+				return BookRecord{}, fmt.Errorf("ambiguous book query %q matched %d books: %s", q, len(candidates), strings.Join(names, ", "))
+			}
+		}
+	}
 	s.mu.RUnlock()
 
-	if !exists {
-		return errors.New("book not found")
+	if !found {
+		return BookRecord{}, fmt.Errorf("book %q not found", q)
 	}
 	if qc != nil {
-		_ = qc.DeleteByBookID(ctx, bookID)
+		_ = qc.DeleteByBookID(ctx, matched.ID)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.deleteBookLocked(bookID)
+	s.deleteBookLocked(matched.ID)
 	s.rebuildBM25Locked()
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		return matched, err
+	}
+	return matched, nil
 }
 
 func (s *Store) deleteBookLocked(bookID string) {

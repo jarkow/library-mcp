@@ -194,6 +194,33 @@ func main() {
 		fmt.Printf("Indexed Books (%d):\n", len(books))
 		printBookRecords(books)
 
+	case "remove", "delete", "rm":
+		fs := flag.NewFlagSet("remove", flag.ExitOnError)
+		allFlag := fs.Bool("all", false, "Remove all indexed books from the catalog")
+		_ = fs.Parse(args)
+
+		if *allFlag {
+			books := st.ListBooks()
+			for _, b := range books {
+				_, _ = st.RemoveBook(ctx, b.ID)
+			}
+			fmt.Printf("Removed all %d books from the catalog.\n", len(books))
+			return
+		}
+
+		target := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		if target == "" {
+			fmt.Fprintln(os.Stderr, "Usage: library-mcp remove <book-id | title | isbn | filename> [--all]")
+			os.Exit(1)
+		}
+		removed, err := st.RemoveBook(ctx, target)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error removing book: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Removed book: [%s] %s by %s (%d chapters, %d parent sections, %d child chunks)\n",
+			removed.ID, removed.Title, removed.Author, removed.ChapterCount, removed.ParentCount, removed.ChunkCount)
+
 	case "status":
 		bCount, chCount, pCount, ckCount, vCount := st.Stats()
 		cats, tags := st.ListCategoriesAndTags()
@@ -331,6 +358,7 @@ Commands:
   search [--category <c>] [--tag <t>] <query> Hybrid RRF search promoting Parent Sections
   ask [--book <filter>] <question>            Ask a technical question answered by local Ollama with citations
   books [--category <c>] [--tag <t>]          List indexed EPUB books with categories, tags, and web metadata
+  remove <id-or-title> [--all]                Remove an indexed book by ID, title, ISBN, or filename
   status                                      Show Qdrant, Ollama, and library catalog status
   config [--books-dir <path>]                 View or update configuration (Windows, Linux, and WSL paths)
   serve [--port 8765]                         Start the local Web UI on http://127.0.0.1:8765
