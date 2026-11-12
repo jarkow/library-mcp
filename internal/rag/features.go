@@ -11,17 +11,12 @@ import (
 	"time"
 
 	"library-mcp/internal/config"
+	"library-mcp/internal/domain"
 	"library-mcp/internal/store"
 )
 
 // WatcherEvent records a file-watcher auto-ingestion event.
-type WatcherEvent struct {
-	Timestamp string `json:"timestamp"`
-	File      string `json:"file"`
-	BookTitle string `json:"book_title,omitempty"`
-	Chunks    int    `json:"chunks,omitempty"`
-	Status    string `json:"status"`
-}
+type WatcherEvent = domain.WatcherEvent
 
 // SearchWithOptions executes hybrid search with category, tag, author, year, code-only, and per-book diversity options.
 func (e *Engine) SearchWithOptions(ctx context.Context, opts store.SearchOptions) []store.SearchResult {

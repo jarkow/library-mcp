@@ -17,93 +17,33 @@ import (
 	"strings"
 	"time"
 
+	"library-mcp/internal/domain"
 	"library-mcp/internal/epub"
 )
 
 // SearchOptions configures advanced filtered and diversity-aware Parent-Child search.
-type SearchOptions struct {
-	Query      string `json:"query"`
-	Mode       string `json:"mode"`
-	BookFilter string `json:"book_filter,omitempty"`
-	Category   string `json:"category,omitempty"`
-	Tag        string `json:"tag,omitempty"`
-	Author     string `json:"author,omitempty"`
-	YearMin    int    `json:"year_min,omitempty"`
-	MaxPerBook int    `json:"max_per_book,omitempty"`
-	CodeOnly   bool   `json:"code_only,omitempty"`
-	TopK       int    `json:"top_k,omitempty"`
-}
+type SearchOptions = domain.SearchOptions
 
 // NoteRecord stores a persistent user or AI-agent annotation, bookmark, or architectural note linked to a book/chapter/section.
-type NoteRecord struct {
-	ID           string   `json:"id"`
-	BookID       string   `json:"book_id,omitempty"`
-	BookTitle    string   `json:"book_title,omitempty"`
-	Author       string   `json:"author,omitempty"`
-	ChapterID    string   `json:"chapter_id,omitempty"`
-	ChapterTitle string   `json:"chapter_title,omitempty"`
-	ParentID     string   `json:"parent_id,omitempty"`
-	SectionTitle string   `json:"section_title,omitempty"`
-	Title        string   `json:"title"`
-	Content      string   `json:"content"`
-	Tags         []string `json:"tags,omitempty"`
-	CreatedAt    string   `json:"created_at"`
-	UpdatedAt    string   `json:"updated_at"`
-}
+type NoteRecord = domain.NoteRecord
 
 // TOCSection represents a ParentSection entry inside a book's Table of Contents.
-type TOCSection struct {
-	ParentID     string `json:"parent_id"`
-	SectionIndex int    `json:"section_index"`
-	Title        string `json:"title"`
-	CharLength   int    `json:"char_length"`
-}
+type TOCSection = domain.TOCSection
 
 // TOCChapter represents a chapter and its nested ParentSections in a book's Table of Contents.
-type TOCChapter struct {
-	ChapterID    string       `json:"chapter_id"`
-	ChapterIndex int          `json:"chapter_index"`
-	Title        string       `json:"title"`
-	CharLength   int          `json:"char_length"`
-	Sections     []TOCSection `json:"sections,omitempty"`
-}
+type TOCChapter = domain.TOCChapter
 
 // BookTOC holds a book's bibliographic record and full hierarchical Table of Contents.
-type BookTOC struct {
-	Book     BookRecord   `json:"book"`
-	Chapters []TOCChapter `json:"chapters"`
-}
+type BookTOC = domain.BookTOC
 
 // ChapterSearchHit represents a matched chapter or parent section heading from SearchChapters.
-type ChapterSearchHit struct {
-	BookID       string  `json:"book_id"`
-	BookTitle    string  `json:"book_title"`
-	Author       string  `json:"author"`
-	Category     string  `json:"category"`
-	ChapterID    string  `json:"chapter_id"`
-	ChapterIndex int     `json:"chapter_index"`
-	ChapterTitle string  `json:"chapter_title"`
-	ParentID     string  `json:"parent_id,omitempty"`
-	SectionTitle string  `json:"section_title,omitempty"`
-	Snippet      string  `json:"snippet"`
-	Score        float64 `json:"score"`
-}
+type ChapterSearchHit = domain.ChapterSearchHit
 
 // DuplicateGroup represents a group of duplicate or near-duplicate editions of the same book.
-type DuplicateGroup struct {
-	Key        string       `json:"key"`
-	Reason     string       `json:"reason"`
-	Keep       BookRecord   `json:"keep"`
-	Duplicates []BookRecord `json:"duplicates"`
-}
+type DuplicateGroup = domain.DuplicateGroup
 
 // DedupReport summarizes duplicate book detection and optional pruning.
-type DedupReport struct {
-	Groups       []DuplicateGroup `json:"groups"`
-	RemovedBooks []BookRecord     `json:"removed_books,omitempty"`
-	FreedChunks  int              `json:"freed_chunks"`
-	Applied      bool             `json:"applied"`
-}
+type DedupReport = domain.DedupReport
 
 type catalogMetaFile struct {
 	Version       int                   `json:"version"`

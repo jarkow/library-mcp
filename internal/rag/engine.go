@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"library-mcp/internal/config"
+	"library-mcp/internal/domain"
 	"library-mcp/internal/epub"
 	"library-mcp/internal/metadata"
 	"library-mcp/internal/ollama"
@@ -21,36 +22,22 @@ import (
 )
 
 // IngestReport summarizes a batch or single-file ingestion run.
-type IngestReport struct {
-	ScannedDirs  int                `json:"scanned_dirs"`
-	ScannedFiles int                `json:"scanned_files"`
-	IndexedBooks int                `json:"indexed_books"`
-	SkippedBooks int                `json:"skipped_books"`
-	TotalParents int                `json:"total_parents"`
-	TotalChunks  int                `json:"total_chunks"`
-	Embedded     bool               `json:"embedded"`
-	Books        []store.BookRecord `json:"books,omitempty"`
-	Errors       []string           `json:"errors"`
-	DurationMs   int64              `json:"duration_ms"`
-}
+type IngestReport = domain.IngestReport
 
 // AskResponse holds the grounded LLM response and its Parent-Child source citations.
-type AskResponse struct {
-	Question   string               `json:"question"`
-	Answer     string               `json:"answer"`
-	Model      string               `json:"model"`
-	Sources    []store.SearchResult `json:"sources"`
-	DurationMs int64                `json:"duration_ms"`
-}
+type AskResponse = domain.AskResponse
 
-// Engine coordinates EPUB ingestion, web metadata enrichment, Qdrant hybrid retrieval, Parent-Child promotion, and Ollama generation.
+var _ domain.LibraryService = (*Engine)(nil)
+
+// Engine is the application use-case service (implementing domain.LibraryService) that coordinates
+// multi-format book parsing, bibliographic enrichment, hybrid vector/FTS5 retrieval, Parent-Child promotion, and RAG generation.
 type Engine struct {
 	mu                 sync.RWMutex
 	cfg                *config.Config
 	store              *store.Store
-	ollama             *ollama.Client
-	qdrant             *qdrant.Client
-	enricher           *metadata.Enricher
+	ollama             domain.AIGateway
+	qdrant             domain.VectorIndex
+	enricher           domain.MetadataGateway
 	ollamaOfflineUntil time.Time
 	watcherEvents      []WatcherEvent
 }
@@ -71,17 +58,34 @@ func (e *Engine) RecentWatcherEvents() []WatcherEvent {
 	return append([]WatcherEvent(nil), e.watcherEvents...)
 }
 
-// NewEngine creates a new RAG Engine for the given configuration and store.
+// NewEngine creates a new RAG Engine wired with the default Qdrant, Ollama, and Web Metadata adapters.
 func NewEngine(cfg *config.Config, st *store.Store) *Engine {
 	qc := qdrant.NewClient(cfg.QdrantURL, cfg.QdrantCollection)
 	st.SetQdrantClient(qc)
+	return NewEngineWithPorts(cfg, st, ollama.NewClient(cfg.OllamaURL), qc, metadata.NewEnricher())
+}
+
+// NewEngineWithPorts creates a new RAG Engine injected with custom Hexagonal Driven Port implementations.
+func NewEngineWithPorts(cfg *config.Config, st *store.Store, ai domain.AIGateway, vec domain.VectorIndex, meta domain.MetadataGateway) *Engine {
 	return &Engine{
 		cfg:      cfg,
 		store:    st,
-		ollama:   ollama.NewClient(cfg.OllamaURL),
-		qdrant:   qc,
-		enricher: metadata.NewEnricher(),
+		ollama:   ai,
+		qdrant:   vec,
+		enricher: meta,
 	}
+}
+
+// Catalog returns the underlying CatalogRepository port.
+func (e *Engine) Catalog() domain.CatalogRepository {
+	return e.store
+}
+
+// SetMetadataGateway sets a custom MetadataGateway port implementation (e.g. for offline unit testing).
+func (e *Engine) SetMetadataGateway(meta domain.MetadataGateway) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.enricher = meta
 }
 
 // UpdateConfig updates the engine configuration and refreshes the Ollama and Qdrant clients.
@@ -446,7 +450,7 @@ func (e *Engine) Ask(ctx context.Context, question, bookFilter string, topK int)
 	if len(sources) == 0 {
 		return &AskResponse{
 			Question:   question,
-			Answer:     "No matching passages were found in your indexed library. Try indexing books from your configured books directory (`H:\\Books`) first.",
+			Answer:     fmt.Sprintf("No matching passages were found in your indexed library. Try indexing books from your configured books directory (%q) first.", cfg.BooksDir),
 			Model:      cfg.ChatModel,
 			Sources:    nil,
 			DurationMs: time.Since(start).Milliseconds(),

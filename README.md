@@ -31,67 +31,79 @@ Standard naive RAG pipelines split books into fixed 500-character slices. For te
 
 ---
 
-## Architecture Overview
+## Architecture Overview (Hexagonal / Ports & Adapters)
+
+The project follows **Domain-Driven Design (DDD)** and **Hexagonal Architecture (Ports & Adapters)** in idiomatic Go:
+
+- **Domain & Ports Core (`internal/domain`)**: Pure domain entities (`ParsedBook`, `BookRecord`, `ParentSection`, `ParsedChunk`, `NoteRecord`, `BookTOC`) and port interfaces (`LibraryService`, `CatalogRepository`, `VectorIndex`, `AIGateway`, `MetadataGateway`) with zero external dependencies.
+- **Application Layer (`internal/rag`)**: Implements `domain.LibraryService`, orchestrating multi-format ingestion, Parent-Child RAG retrieval, cross-book comparisons, code extraction, study dossiers, and live folder watching via driven ports.
+- **Driving Adapters (Inbound)**:
+  - `cmd/library-mcp`: CLI & Composition Root
+  - `internal/mcp`: MCP JSON-RPC 2.0 `stdio` Server
+  - `internal/web`: Local Web UI & REST API Server
+- **Driven Adapters (Outbound)**:
+  - `internal/store`: SQLite + FTS5 Catalog Repository (`domain.CatalogRepository`)
+  - `internal/qdrant`: Qdrant Hybrid Vector Index (`domain.VectorIndex`)
+  - `internal/ollama`: Local Ollama Embeddings & Chat Gateway (`domain.AIGateway`)
+  - `internal/metadata`: Google Books & Open Library Metadata + Taxonomy Classifier (`domain.MetadataGateway`)
+  - `internal/epub`: Multi-Format Book Parser (`.epub`, `.pdf`, `.mobi`, `.azw3`)
 
 ```mermaid
 flowchart LR
-    subgraph Input["Book Library (Recursive)"]
-        EPUB[".epub / .pdf / .mobi"]
+    subgraph Driving["Driving Adapters (Inbound)"]
+        MCP["MCP Server (stdio)\ninternal/mcp"]
+        CLI["CLI\ncmd/library-mcp"]
+        UI["Web UI\ninternal/web"]
     end
 
-    subgraph Parser["Structure-Aware Parser & Enricher"]
-        P1["Chapters & Code/Table Preservation"]
-        P2["Parent Sections (~3200 chars)"]
-        P3["Child Chunks (~650 chars)"]
-        WEB["Web Metadata & Taxonomy\n(Google Books + Open Library)"]
-        P1 --> P2 --> P3
+    subgraph Core["Application & Domain Core"]
+        DOM["Domain Entities & Ports\ninternal/domain"]
+        APP["LibraryService Use Cases\ninternal/rag"]
+        APP --> DOM
     end
 
-    subgraph Storage["Hybrid Storage Layer"]
-        QD[("Qdrant Vector DB\nDense (bge-m3) + Sparse (IDF)")]
-        LOC[("SQLite + FTS5 Catalog\ndata/library.db\ndata/vectors.bin")]
+    subgraph Driven["Driven Adapters (Outbound)"]
+        PARSER["Book Parser (.epub/.pdf/.mobi)\ninternal/epub"]
+        META["Web Metadata & Taxonomy\ninternal/metadata"]
+        SQL[("SQLite + FTS5 Catalog\ninternal/store\ndata/library.db")]
+        QD[("Qdrant Vector DB\ninternal/qdrant\ndata/qdrant_storage")]
+        AI["Ollama Embeddings & LLM\ninternal/ollama"]
     end
 
-    subgraph Consumers["Interfaces"]
-        MCP["MCP Server (stdio)\nAntigravity / Claude / Cursor"]
-        CLI["CLI\nlibrary-mcp"]
-        UI["Web UI\nhttp://127.0.0.1:8765"]
-    end
-
-    EPUB --> Parser
-    P2 --> LOC
-    WEB --> LOC
-    P3 --> QD
-    P3 --> LOC
-    QD <-->|"1. Find Top Child Chunks (Vector + RRF)"| Consumers
-    LOC <-->|"2. Promote to Full Parent Sections / Chapters / TOC / FTS5"| Consumers
+    Driving -->|"domain.LibraryService"| APP
+    APP --> PARSER
+    APP -->|"domain.MetadataGateway"| META
+    APP -->|"domain.CatalogRepository"| SQL
+    APP -->|"domain.VectorIndex"| QD
+    APP -->|"domain.AIGateway"| AI
+    SQL -->|"domain.VectorIndex"| QD
 ```
 
 ---
 
 ## SQLite (`data/library.db`) vs. Qdrant: What Each One Does (In Plain English)
 
-When the program reads one of your books, it splits the book into three sizes:
+When the program reads a book, it splits the book into three sizes:
 1. **Whole Chapters** (10–30 pages of text — used when you want to read an entire chapter).
 2. **Medium Sections ("Parent Sections")** (~1–2 pages of text — big enough to hold a complete explanation and a full code example without cutting it in half).
 3. **Small Paragraphs ("Child Chunks")** (a single short paragraph — small enough to accurately match a specific question).
 
-Because your library has **205 books** (over **348,000 paragraphs**), we use two databases that each do what they are best at:
+To keep searches fast and accurate across large ebook collections, the project uses two databases that each do what they are best at:
 
 ### 1. What SQLite (`data/library.db`) Is For: **The Library Catalog & Book Text Storage**
 Think of **SQLite** as the actual **library shelves and card catalog** stored in a single local file (`data/library.db`):
 - **Stores all the book text and structure**: Every book's title, author, category, tags, table of contents, full chapters, medium sections, and your personal notes live here.
 - **Instant lookups by ID or filter**: When you ask *"Show me all books in the Security category"*, *"Show me the Table of Contents of Book X"*, or *"Open Chapter 3"*, SQLite answers in a few milliseconds.
-- **Built-in Keyword Search (Works without Docker)**: SQLite also has a built-in word search index. If you search for exact words like `"io.LimitReader"` or `"bounded context"`—or if Docker is turned off—SQLite can search all 348,000 paragraphs by keywords on its own in ~0.25 seconds.
+- **Built-in Keyword Search (Works without Docker)**: SQLite also maintains a built-in word search index. If you search for exact words like `"io.LimitReader"` or `"bounded context"`—or if Docker is turned off—SQLite searches all paragraphs by keywords on its own in a fraction of a second.
 
 ### 2. What Qdrant (`data/qdrant_storage/`) Is For: **Searching by Meaning ("AI Concept Search")**
 Think of **Qdrant** as a specialized **AI index that understands meaning, not just exact words**:
 - **Finds ideas even when the words don't match**: Suppose you search for *"how to stop a service from overloading when another server fails"*. A book might call that a *"circuit breaker pattern"* without ever using the word *"overloading"*. Keyword search would miss it, but Qdrant finds it because their **meaning** (represented as number vectors created by Ollama) is close.
-- **Only stores the small paragraphs**: We don't put entire chapters into Qdrant because that would waste gigabytes of RAM. Instead, Qdrant only indexes the small paragraphs and remembers which **Medium Section ID** (`parent_id`) each paragraph came from.
+- **Only stores the small paragraphs**: Full chapters are not duplicated inside Qdrant because that would waste gigabytes of memory. Instead, Qdrant only indexes the small paragraphs and remembers which **Medium Section ID** (`parent_id`) each paragraph came from.
 
 ### 3. How They Work Together When You Search
-1. **Qdrant finds the matching paragraph**: You ask a question. Qdrant searches the 348,000 small paragraphs by **meaning + keywords** and finds the best matches.
-2. **SQLite fetches the complete surrounding section**: Instead of giving the AI just one tiny paragraph (where code might be cut off), the program takes the matching paragraph's section ID and asks **SQLite** for the full **1–2 page Medium Section** (`Parent Section`), plus the book's metadata and any notes you saved.
+1. **Qdrant finds the matching paragraph**: You ask a question. Qdrant searches the small paragraphs by **meaning + keywords** and finds the best matches.
+2. **SQLite fetches the complete surrounding section**: Instead of giving you (or your AI assistant) just one tiny paragraph where a code block might be cut off, the program takes the matching paragraph's section ID and asks **SQLite** for the full **1–2 page Medium Section** (`Parent Section`), plus the book's metadata and any notes you saved.
 3. **If Qdrant/Docker isn't running**: The program automatically falls back to **SQLite's built-in keyword search**, so everything still works offline without Docker.
 
 | Question / Action | Which Database Handles It? |

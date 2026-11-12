@@ -12,26 +12,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"library-mcp/internal/domain"
 )
 
 // BookMetadata holds enriched bibliographic metadata, category, and tags for a book.
-type BookMetadata struct {
-	Title          string   `json:"title"`
-	Subtitle       string   `json:"subtitle,omitempty"`
-	Author         string   `json:"author"`
-	Publisher      string   `json:"publisher,omitempty"`
-	PublishedYear  string   `json:"published_year,omitempty"`
-	ISBN           string   `json:"isbn,omitempty"`
-	PageCount      int      `json:"page_count,omitempty"`
-	Language       string   `json:"language,omitempty"`
-	Description    string   `json:"description,omitempty"`
-	Subjects       []string `json:"subjects,omitempty"`
-	Category       string   `json:"category"`
-	Tags           []string `json:"tags"`
-	CoverURL       string   `json:"cover_url,omitempty"`
-	WebURL         string   `json:"web_url,omitempty"`
-	MetadataSource string   `json:"metadata_source"`
-}
+type BookMetadata = domain.BookMetadata
+
+var _ domain.MetadataGateway = (*Enricher)(nil)
 
 // Enricher fetches book metadata from Open Library and Google Books and classifies books into categories and tags.
 type Enricher struct {

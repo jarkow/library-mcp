@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"library-mcp/internal/domain"
 )
 
 // Client communicates with a local Ollama server.
@@ -19,17 +21,12 @@ type Client struct {
 }
 
 // ModelInfo describes an installed Ollama model.
-type ModelInfo struct {
-	Name       string `json:"name"`
-	ModifiedAt string `json:"modified_at"`
-	Size       int64  `json:"size"`
-}
+type ModelInfo = domain.ModelInfo
 
 // ChatMessage represents a single message in an Ollama conversation.
-type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
+type ChatMessage = domain.ChatMessage
+
+var _ domain.AIGateway = (*Client)(nil)
 
 // NewClient creates a new Ollama API client with sensible timeouts.
 func NewClient(baseURL string) *Client {

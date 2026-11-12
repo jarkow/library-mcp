@@ -13,21 +13,17 @@ import (
 	"time"
 	"unicode"
 
+	"library-mcp/internal/domain"
 	"library-mcp/internal/epub"
 )
 
 // SparseVector represents a Qdrant sparse vector of sorted token hash indices and TF weights.
-type SparseVector struct {
-	Indices []uint32  `json:"indices"`
-	Values  []float32 `json:"values"`
-}
+type SparseVector = domain.SparseVector
 
 // ScoredPoint represents a matched Qdrant child chunk point and its payload.
-type ScoredPoint struct {
-	ID      string           `json:"id"`
-	Score   float64          `json:"score"`
-	Payload epub.ParsedChunk `json:"payload"`
-}
+type ScoredPoint = domain.ScoredPoint
+
+var _ domain.VectorIndex = (*Client)(nil)
 
 // Client communicates with Qdrant's HTTP REST & Universal Query API.
 type Client struct {

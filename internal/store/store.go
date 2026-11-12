@@ -16,50 +16,18 @@ import (
 	"time"
 	"unicode"
 
+	"library-mcp/internal/domain"
 	"library-mcp/internal/epub"
 	"library-mcp/internal/metadata"
-	"library-mcp/internal/qdrant"
 )
 
-// BookRecord stores metadata, category, and tags for an indexed EPUB book.
-type BookRecord struct {
-	ID             string   `json:"id"`
-	FileHash       string   `json:"file_hash"`
-	FileName       string   `json:"file_name"`
-	RelPath        string   `json:"rel_path,omitempty"`
-	Format         string   `json:"format,omitempty"`
-	Title          string   `json:"title"`
-	Subtitle       string   `json:"subtitle,omitempty"`
-	Author         string   `json:"author"`
-	Publisher      string   `json:"publisher"`
-	PublishedYear  string   `json:"published_year,omitempty"`
-	ISBN           string   `json:"isbn,omitempty"`
-	PageCount      int      `json:"page_count,omitempty"`
-	Language       string   `json:"language"`
-	Description    string   `json:"description"`
-	Subjects       []string `json:"subjects"`
-	Category       string   `json:"category"`
-	Tags           []string `json:"tags"`
-	CoverURL       string   `json:"cover_url,omitempty"`
-	WebURL         string   `json:"web_url,omitempty"`
-	MetadataSource string   `json:"metadata_source,omitempty"`
-	ChapterCount   int      `json:"chapter_count"`
-	ParentCount    int      `json:"parent_count"`
-	ChunkCount     int      `json:"chunk_count"`
-	IndexedAt      string   `json:"indexed_at"`
-}
+// BookRecord stores metadata, category, and tags for an indexed book.
+type BookRecord = domain.BookRecord
 
 // SearchResult represents a hierarchical retrieval result containing both the matched child chunk and its promoted ParentSection.
-type SearchResult struct {
-	Chunk        epub.ParsedChunk `json:"chunk"`
-	ParentID     string           `json:"parent_id"`
-	ParentText   string           `json:"parent_text"`
-	ChildHits    int              `json:"child_hits"`
-	Score        float64          `json:"score"`
-	BM25Score    float64          `json:"bm25_score"`
-	VectorScore  float64          `json:"vector_score"`
-	MatchSources []string         `json:"match_sources"`
-}
+type SearchResult = domain.SearchResult
+
+var _ domain.CatalogRepository = (*Store)(nil)
 
 type persistedData struct {
 	Books    map[string]BookRecord         `json:"books"`
@@ -72,7 +40,7 @@ type persistedData struct {
 type Store struct {
 	mu      sync.RWMutex
 	dataDir string
-	qdrant  *qdrant.Client
+	qdrant  domain.VectorIndex
 	db      *sql.DB
 
 	ftsEnabled bool
@@ -97,8 +65,8 @@ type Store struct {
 	batchMode bool
 }
 
-// Open initializes a Store backed by Qdrant and the local Parent/Chapter catalog in dataDir.
-func Open(dataDir string, qdrantClient *qdrant.Client) (*Store, error) {
+// Open initializes a Store backed by a VectorIndex port (e.g., Qdrant) and the local SQLite catalog in dataDir.
+func Open(dataDir string, qdrantClient domain.VectorIndex) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -117,8 +85,8 @@ func Open(dataDir string, qdrantClient *qdrant.Client) (*Store, error) {
 	return s, nil
 }
 
-// SetQdrantClient updates the active Qdrant client.
-func (s *Store) SetQdrantClient(qc *qdrant.Client) {
+// SetQdrantClient updates the active VectorIndex adapter.
+func (s *Store) SetQdrantClient(qc domain.VectorIndex) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.qdrant = qc

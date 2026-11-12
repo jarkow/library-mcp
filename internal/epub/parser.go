@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"library-mcp/internal/domain"
 )
 
 const (
@@ -22,72 +24,17 @@ const (
 	MaxEntryFileSize = 25 * 1024 * 1024  // 25 MB max single uncompressed entry
 )
 
-// ParsedBook represents an extracted EPUB book with chapters, parent sections, and child search chunks.
-type ParsedBook struct {
-	ID             string          `json:"id"`
-	FileHash       string          `json:"file_hash"`
-	FileName       string          `json:"file_name"`
-	RelPath        string          `json:"rel_path,omitempty"`
-	Format         string          `json:"format,omitempty"`
-	Title          string          `json:"title"`
-	Subtitle       string          `json:"subtitle,omitempty"`
-	Author         string          `json:"author"`
-	Publisher      string          `json:"publisher"`
-	PublishedYear  string          `json:"published_year,omitempty"`
-	ISBN           string          `json:"isbn,omitempty"`
-	PageCount      int             `json:"page_count,omitempty"`
-	Language       string          `json:"language"`
-	Description    string          `json:"description"`
-	Subjects       []string        `json:"subjects"`
-	Category       string          `json:"category,omitempty"`
-	Tags           []string        `json:"tags,omitempty"`
-	CoverURL       string          `json:"cover_url,omitempty"`
-	WebURL         string          `json:"web_url,omitempty"`
-	MetadataSource string          `json:"metadata_source,omitempty"`
-	Chapters       []ParsedChapter `json:"chapters"`
-	Parents        []ParentSection `json:"parents"`
-	Chunks         []ParsedChunk   `json:"chunks"`
-}
+// ParsedBook represents an extracted book aggregate from the domain layer.
+type ParsedBook = domain.ParsedBook
 
-// ParsedChapter represents a full chapter in the book spine.
-type ParsedChapter struct {
-	ID           string `json:"id"`
-	BookID       string `json:"book_id"`
-	ChapterIndex int    `json:"chapter_index"`
-	Title        string `json:"title"`
-	Href         string `json:"href"`
-	Content      string `json:"content"`
-}
+// ParsedChapter represents a full chapter in the book spine from the domain layer.
+type ParsedChapter = domain.ParsedChapter
 
-// ParentSection represents a complete structural section (~2000-4000 chars) returned to the LLM during Parent-Child RAG.
-type ParentSection struct {
-	ID           string `json:"id"`
-	BookID       string `json:"book_id"`
-	ChapterID    string `json:"chapter_id"`
-	BookTitle    string `json:"book_title"`
-	Author       string `json:"author"`
-	ChapterTitle string `json:"chapter_title"`
-	SectionTitle string `json:"section_title"`
-	ParentIndex  int    `json:"parent_index"`
-	HasCode      bool   `json:"has_code"`
-	Content      string `json:"content"`
-}
+// ParentSection represents a complete structural section (~2000-4000 chars) from the domain layer.
+type ParentSection = domain.ParentSection
 
-// ParsedChunk represents a fine-grained child chunk (~650 chars) indexed in Qdrant and linked to its ParentSection.
-type ParsedChunk struct {
-	ID           string `json:"id"`
-	PointUUID    string `json:"point_uuid"`
-	ParentID     string `json:"parent_id"`
-	BookID       string `json:"book_id"`
-	ChapterID    string `json:"chapter_id"`
-	BookTitle    string `json:"book_title"`
-	Author       string `json:"author"`
-	ChapterTitle string `json:"chapter_title"`
-	SectionTitle string `json:"section_title"`
-	ChunkIndex   int    `json:"chunk_index"`
-	HasCode      bool   `json:"has_code"`
-	Text         string `json:"text"`
-}
+// ParsedChunk represents a fine-grained child chunk (~650 chars) from the domain layer.
+type ParsedChunk = domain.ParsedChunk
 
 type containerXML struct {
 	Rootfiles []struct {

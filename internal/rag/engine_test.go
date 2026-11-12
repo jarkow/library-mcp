@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"library-mcp/internal/config"
+	"library-mcp/internal/metadata"
 	"library-mcp/internal/store"
 )
 
@@ -43,9 +44,8 @@ func TestRecursiveDirectoryIngestion(t *testing.T) {
 	}
 	defer st.Close()
 	eng := NewEngine(cfg, st)
-	// Avoid external network calls in unit tests
-	eng.enricher.GoogleBaseURL = ""
-	eng.enricher.OpenLibURL = ""
+	// Avoid external network calls in unit tests by injecting an offline MetadataGateway port
+	eng.SetMetadataGateway(&metadata.Enricher{})
 
 	rep, err := eng.IngestDir(context.Background(), rootDir, false, nil)
 	if err != nil {
