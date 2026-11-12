@@ -4,6 +4,8 @@ library-mcp.exe
 smart-lib
 smart-lib.exe
 *.exe
+*.exe~
+*~
 *.dll
 *.so
 *.dylib
