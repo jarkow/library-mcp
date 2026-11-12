@@ -21,6 +21,7 @@ import (
 
 // IngestReport summarizes a batch or single-file ingestion run.
 type IngestReport struct {
+	ScannedDirs  int                `json:"scanned_dirs"`
 	ScannedFiles int                `json:"scanned_files"`
 	IndexedBooks int                `json:"indexed_books"`
 	SkippedBooks int                `json:"skipped_books"`
@@ -117,14 +118,20 @@ func (e *Engine) IngestDir(ctx context.Context, dirPath string, force bool, prog
 	}
 
 	var epubFiles []string
+	scannedDirs := 0
 	err = filepath.WalkDir(targetDir, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
 		}
 		if d.IsDir() {
+			name := d.Name()
+			if p != targetDir && strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			scannedDirs++
 			return nil
 		}
-		if strings.EqualFold(filepath.Ext(d.Name()), ".epub") {
+		if isSupportedBookFile(d.Name()) {
 			if config.IsSafeSubpath(p, targetDir) {
 				epubFiles = append(epubFiles, p)
 			}
@@ -136,16 +143,21 @@ func (e *Engine) IngestDir(ctx context.Context, dirPath string, force bool, prog
 	}
 
 	report := &IngestReport{
+		ScannedDirs:  scannedDirs,
 		ScannedFiles: len(epubFiles),
 	}
 
 	for i, filePath := range epubFiles {
+		relDisplay := filepath.Base(filePath)
+		if rel, relErr := filepath.Rel(targetDir, filePath); relErr == nil && rel != "" && rel != "." {
+			relDisplay = filepath.ToSlash(rel)
+		}
 		if progressFn != nil {
-			progressFn(filepath.Base(filePath), i+1, len(epubFiles))
+			progressFn(relDisplay, i+1, len(epubFiles))
 		}
 		indexed, parentsCount, chunksCount, embedded, err := e.IngestFile(ctx, filePath, targetDir, force)
 		if err != nil {
-			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", filepath.Base(filePath), err))
+			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", relDisplay, err))
 			continue
 		}
 		if !indexed {
@@ -192,7 +204,22 @@ func (e *Engine) IngestFile(ctx context.Context, filePath, allowedBaseDir string
 		return false, 0, 0, false, err
 	}
 	if len(parsed.Chunks) == 0 {
-		return false, 0, 0, false, fmt.Errorf("no readable text chunks found in EPUB")
+		return false, 0, 0, false, fmt.Errorf("no readable text chunks found in book")
+	}
+
+	if allowedBaseDir != "" {
+		if rel, relErr := filepath.Rel(allowedBaseDir, filePath); relErr == nil && rel != "" && rel != "." {
+			parsed.RelPath = filepath.ToSlash(rel)
+			dirPart := filepath.ToSlash(filepath.Dir(rel))
+			if dirPart != "." && dirPart != "" {
+				for _, seg := range strings.Split(dirPart, "/") {
+					seg = strings.TrimSpace(seg)
+					if seg != "" {
+						parsed.Subjects = append(parsed.Subjects, seg)
+					}
+				}
+			}
+		}
 	}
 
 	e.enrichParsedBook(ctx, parsed)
@@ -429,4 +456,9 @@ func (e *Engine) ListOllamaModels(ctx context.Context) ([]ollama.ModelInfo, erro
 	client := e.ollama
 	e.mu.RUnlock()
 	return client.ListModels(ctx)
+}
+
+func isSupportedBookFile(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	return ext == ".epub"
 }

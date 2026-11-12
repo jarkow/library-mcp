@@ -27,6 +27,7 @@ type ParsedBook struct {
 	ID             string          `json:"id"`
 	FileHash       string          `json:"file_hash"`
 	FileName       string          `json:"file_name"`
+	RelPath        string          `json:"rel_path,omitempty"`
 	Title          string          `json:"title"`
 	Subtitle       string          `json:"subtitle,omitempty"`
 	Author         string          `json:"author"`

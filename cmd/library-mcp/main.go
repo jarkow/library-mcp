@@ -72,6 +72,7 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("\nIngestion Complete (%d ms):\n", report.DurationMs)
+		fmt.Printf("  Scanned Dirs   : %d\n", report.ScannedDirs)
 		fmt.Printf("  Scanned Files  : %d\n", report.ScannedFiles)
 		fmt.Printf("  Indexed Books  : %d\n", report.IndexedBooks)
 		fmt.Printf("  Skipped Books  : %d\n", report.SkippedBooks)

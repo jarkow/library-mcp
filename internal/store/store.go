@@ -28,6 +28,7 @@ type BookRecord struct {
 	ID             string   `json:"id"`
 	FileHash       string   `json:"file_hash"`
 	FileName       string   `json:"file_name"`
+	RelPath        string   `json:"rel_path,omitempty"`
 	Title          string   `json:"title"`
 	Subtitle       string   `json:"subtitle,omitempty"`
 	Author         string   `json:"author"`
@@ -273,6 +274,7 @@ func (s *Store) UpsertBook(ctx context.Context, book *epub.ParsedBook, embedding
 		ID:             book.ID,
 		FileHash:       book.FileHash,
 		FileName:       book.FileName,
+		RelPath:        book.RelPath,
 		Title:          book.Title,
 		Subtitle:       book.Subtitle,
 		Author:         book.Author,
@@ -351,6 +353,7 @@ func (s *Store) RemoveBook(ctx context.Context, idOrQuery string) (BookRecord, e
 			if strings.EqualFold(b.ID, q) ||
 				strings.EqualFold(b.Title, q) ||
 				strings.EqualFold(b.FileName, q) ||
+				(b.RelPath != "" && strings.EqualFold(b.RelPath, q)) ||
 				(b.ISBN != "" && strings.EqualFold(b.ISBN, q)) {
 				matched = b
 				found = true
@@ -361,7 +364,8 @@ func (s *Store) RemoveBook(ctx context.Context, idOrQuery string) (BookRecord, e
 			var candidates []BookRecord
 			for _, b := range s.books {
 				if strings.Contains(strings.ToLower(b.Title), lowerQ) ||
-					strings.Contains(strings.ToLower(b.FileName), lowerQ) {
+					strings.Contains(strings.ToLower(b.FileName), lowerQ) ||
+					strings.Contains(strings.ToLower(b.RelPath), lowerQ) {
 					candidates = append(candidates, b)
 				}
 			}
