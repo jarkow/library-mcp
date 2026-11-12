@@ -29,6 +29,7 @@ type BookRecord struct {
 	FileHash       string   `json:"file_hash"`
 	FileName       string   `json:"file_name"`
 	RelPath        string   `json:"rel_path,omitempty"`
+	Format         string   `json:"format,omitempty"`
 	Title          string   `json:"title"`
 	Subtitle       string   `json:"subtitle,omitempty"`
 	Author         string   `json:"author"`
@@ -275,6 +276,7 @@ func (s *Store) UpsertBook(ctx context.Context, book *epub.ParsedBook, embedding
 		FileHash:       book.FileHash,
 		FileName:       book.FileName,
 		RelPath:        book.RelPath,
+		Format:         book.Format,
 		Title:          book.Title,
 		Subtitle:       book.Subtitle,
 		Author:         book.Author,

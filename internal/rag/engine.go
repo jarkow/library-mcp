@@ -2,6 +2,7 @@ package rag
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -183,14 +184,17 @@ func (e *Engine) IngestDir(ctx context.Context, dirPath string, force bool, prog
 	return report, nil
 }
 
-// IngestFile parses, enriches web metadata & tags/category, and indexes a single EPUB file verified to reside inside allowedBaseDir.
+// IngestFile parses, enriches web metadata & tags/category, and indexes a single EPUB, PDF, or MOBI file verified to reside inside allowedBaseDir.
 func (e *Engine) IngestFile(ctx context.Context, filePath, allowedBaseDir string, force bool) (bool, int, int, bool, error) {
 	if allowedBaseDir != "" && !config.IsSafeSubpath(filePath, allowedBaseDir) {
 		return false, 0, 0, false, fmt.Errorf("security violation: path outside allowed directory boundary")
 	}
 
-	fileHash, _, err := epub.ValidateEPUBHeader(filePath)
+	fileHash, _, _, err := epub.ValidateBookHeader(filePath)
 	if err != nil {
+		if errors.Is(err, epub.ErrSkipNonBookSidecar) {
+			return false, 0, 0, false, nil
+		}
 		return false, 0, 0, false, err
 	}
 
@@ -199,7 +203,7 @@ func (e *Engine) IngestFile(ctx context.Context, filePath, allowedBaseDir string
 	}
 
 	cfg := e.GetConfig()
-	parsed, err := epub.ParseFile(filePath, cfg.ParentChunkSize, cfg.ChildChunkSize, cfg.ChildOverlap)
+	parsed, err := epub.ParseBookFile(filePath, cfg.ParentChunkSize, cfg.ChildChunkSize, cfg.ChildOverlap)
 	if err != nil {
 		return false, 0, 0, false, err
 	}
@@ -459,6 +463,5 @@ func (e *Engine) ListOllamaModels(ctx context.Context) ([]ollama.ModelInfo, erro
 }
 
 func isSupportedBookFile(name string) bool {
-	ext := strings.ToLower(filepath.Ext(name))
-	return ext == ".epub"
+	return epub.IsSupportedBookExtension(name)
 }

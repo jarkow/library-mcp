@@ -451,8 +451,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	origBase := filepath.Base(header.Filename)
-	if !strings.EqualFold(filepath.Ext(origBase), ".epub") {
-		writeJSONError(w, http.StatusBadRequest, "Only .epub files are allowed.")
+	ext := strings.ToLower(filepath.Ext(origBase))
+	if !epub.IsSupportedBookExtension(origBase) {
+		writeJSONError(w, http.StatusBadRequest, "Only .epub, .pdf, .mobi, .azw, and .azw3 files are allowed.")
 		return
 	}
 
@@ -464,7 +465,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rename uploaded file to a random UUID string outside the web root
-	safeFileName := randomHex(16) + ".epub"
+	safeFileName := randomHex(16) + ext
 	destPath := filepath.Join(uploadsDir, safeFileName)
 	if !config.IsSafeSubpath(destPath, uploadsDir) {
 		writeJSONError(w, http.StatusBadRequest, "Invalid destination path.")
@@ -485,9 +486,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate magic bytes and structure before indexing
-	if _, _, err := epub.ValidateEPUBHeader(destPath); err != nil {
+	if _, _, _, err := epub.ValidateBookHeader(destPath); err != nil {
 		_ = os.Remove(destPath)
-		writeJSONError(w, http.StatusBadRequest, "Uploaded file is not a valid EPUB archive.")
+		writeJSONError(w, http.StatusBadRequest, "Uploaded file is not a valid EPUB, PDF, or MOBI archive.")
 		return
 	}
 

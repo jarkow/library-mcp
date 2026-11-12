@@ -28,6 +28,7 @@ type ParsedBook struct {
 	FileHash       string          `json:"file_hash"`
 	FileName       string          `json:"file_name"`
 	RelPath        string          `json:"rel_path,omitempty"`
+	Format         string          `json:"format,omitempty"`
 	Title          string          `json:"title"`
 	Subtitle       string          `json:"subtitle,omitempty"`
 	Author         string          `json:"author"`
@@ -368,6 +369,7 @@ func ParseFile(filePath string, parentSize, childSize, childOverlap int) (*Parse
 		ID:            bookID,
 		FileHash:      fileHash,
 		FileName:      filepath.Base(filePath),
+		Format:        "epub",
 		Title:         title,
 		Author:        author,
 		Publisher:     publisher,
