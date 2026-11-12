@@ -1,0 +1,15 @@
+{
+  "books_dir": "H:\\Books",
+  "data_dir": "./data",
+  "qdrant_url": "http://127.0.0.1:6333",
+  "qdrant_collection": "smart_library_chunks",
+  "ollama_url": "http://127.0.0.1:11434",
+  "embedding_model": "bge-m3",
+  "chat_model": "qwen2.5-coder:14b",
+  "parent_chunk_size": 3200,
+  "child_chunk_size": 650,
+  "child_overlap": 120,
+  "top_k": 6,
+  "host": "127.0.0.1",
+  "port": 8765
+}

@@ -1,0 +1,479 @@
+(function () {
+  "use strict";
+
+  function getCSRFToken() {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    return meta ? meta.getAttribute("content") || "" : "";
+  }
+
+  async function apiFetch(url, options) {
+    const opts = Object.assign({ headers: {} }, options || {});
+    if (opts.method === "POST") {
+      opts.headers["X-CSRF-Token"] = getCSRFToken();
+      if (opts.body && typeof opts.body === "string" && !opts.headers["Content-Type"]) {
+        opts.headers["Content-Type"] = "application/json";
+      }
+    }
+    const resp = await fetch(url, opts);
+    const data = await resp.json().catch(function () {
+      return { error: "Unexpected response from server" };
+    });
+    if (!resp.ok) {
+      throw new Error(data.error || "Request failed with status " + resp.status);
+    }
+    return data;
+  }
+
+  function showToast(message) {
+    const banner = document.getElementById("toast-banner");
+    if (!banner) return;
+    banner.textContent = message;
+    banner.classList.remove("hidden");
+    window.setTimeout(function () {
+      banner.classList.add("hidden");
+    }, 5000);
+  }
+
+  function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (typeof text === "string") node.textContent = text;
+    return node;
+  }
+
+  async function refreshStatusAndBooks() {
+    try {
+      const st = await apiFetch("/api/status");
+      const qdrantPill = document.getElementById("qdrant-pill");
+      qdrantPill.textContent = st.qdrant_online ? "Qdrant: Online (Hybrid RRF)" : "Qdrant: Offline (Local Fallback)";
+      qdrantPill.className = st.qdrant_online ? "pill pill-ok" : "pill pill-warn";
+
+      const ollamaPill = document.getElementById("ollama-pill");
+      ollamaPill.textContent = st.ollama_online
+        ? "Ollama: " + st.config.chat_model
+        : "Ollama: Offline";
+      ollamaPill.className = st.ollama_online ? "pill pill-ok" : "pill pill-warn";
+
+      const statsPill = document.getElementById("stats-pill");
+      statsPill.textContent =
+        st.books_count + " Books | " + st.parents_count + " Parents | " + st.chunks_count + " Chunks";
+
+      populateSettingsForm(st.config, st.resolved_books_dir);
+    } catch (err) {
+      showToast("Status check failed: " + err.message);
+    }
+
+    try {
+      const data = await apiFetch("/api/books");
+      renderBooksList(data.books || []);
+    } catch (err) {
+      showToast("Failed to load books: " + err.message);
+    }
+  }
+
+  function populateSettingsForm(cfg, resolvedDir) {
+    if (!cfg) return;
+    document.getElementById("cfg-books-dir").value = cfg.books_dir || "";
+    document.getElementById("cfg-resolved-dir").textContent = "Resolved path: " + (resolvedDir || "");
+    document.getElementById("cfg-qdrant-url").value = cfg.qdrant_url || "";
+    document.getElementById("cfg-ollama-url").value = cfg.ollama_url || "";
+    document.getElementById("cfg-embed-model").value = cfg.embedding_model || "";
+    document.getElementById("cfg-chat-model").value = cfg.chat_model || "";
+    document.getElementById("cfg-parent-size").value = String(cfg.parent_chunk_size || 3200);
+    document.getElementById("cfg-child-size").value = String(cfg.child_chunk_size || 650);
+    document.getElementById("cfg-top-k").value = String(cfg.top_k || 6);
+  }
+
+  function renderBooksList(books) {
+    const container = document.getElementById("books-list");
+    const select = document.getElementById("book-filter-select");
+    container.replaceChildren();
+
+    const currentVal = select.value;
+    select.replaceChildren();
+    const defaultOpt = el("option", "", "All Indexed Books");
+    defaultOpt.value = "";
+    select.appendChild(defaultOpt);
+
+    if (books.length === 0) {
+      const empty = el("p", "muted", "No EPUBs indexed yet. Click 'Scan Books Dir' or upload an .epub file.");
+      container.appendChild(empty);
+      return;
+    }
+
+    books.forEach(function (b) {
+      const opt = el("option", "", b.title + " (" + b.author + ")");
+      opt.value = b.id;
+      select.appendChild(opt);
+
+      const card = el("div", "book-card");
+      const title = el("div", "book-card-title", b.title);
+      title.addEventListener("click", function () {
+        openBookChapters(b.id);
+      });
+
+      const meta = el(
+        "div",
+        "book-card-meta",
+        b.author + " • " + b.chapter_count + " ch • " + b.parent_count + " sections • " + b.chunk_count + " chunks"
+      );
+
+      const actions = el("div", "book-card-actions");
+      const readBtn = el("button", "btn btn-small btn-secondary", "Browse Chapters");
+      readBtn.type = "button";
+      readBtn.addEventListener("click", function () {
+        openBookChapters(b.id);
+      });
+
+      const delBtn = el("button", "btn btn-small btn-danger", "Remove");
+      delBtn.type = "button";
+      delBtn.addEventListener("click", function () {
+        deleteBook(b.id, b.title);
+      });
+
+      actions.appendChild(readBtn);
+      actions.appendChild(delBtn);
+
+      card.appendChild(title);
+      card.appendChild(meta);
+      card.appendChild(actions);
+      container.appendChild(card);
+    });
+
+    select.value = currentVal;
+  }
+
+  async function openBookChapters(bookId) {
+    try {
+      const data = await apiFetch("/api/book?id=" + encodeURIComponent(bookId));
+      const book = data.book;
+      const chapters = data.chapters || [];
+
+      document.getElementById("reader-title").textContent = book.title;
+      document.getElementById("reader-subtitle").textContent =
+        book.author + " (" + chapters.length + " chapters)";
+
+      const bar = document.getElementById("reader-chapters-bar");
+      bar.replaceChildren();
+      bar.classList.remove("hidden");
+
+      chapters.forEach(function (ch) {
+        const btn = el("button", "btn btn-small btn-secondary", ch.chapter_index + ". " + ch.title);
+        btn.type = "button";
+        btn.addEventListener("click", function () {
+          loadChapter(ch.id, book.title);
+        });
+        bar.appendChild(btn);
+      });
+
+      if (chapters.length > 0) {
+        await loadChapter(chapters[0].id, book.title);
+      }
+    } catch (err) {
+      showToast("Could not load book details: " + err.message);
+    }
+  }
+
+  async function loadChapter(chapterId, bookTitle) {
+    try {
+      const data = await apiFetch("/api/chapter?id=" + encodeURIComponent(chapterId));
+      const ch = data.chapter;
+      document.getElementById("reader-title").textContent = (bookTitle ? bookTitle + " — " : "") + ch.title;
+      document.getElementById("reader-subtitle").textContent = "Full Chapter View (ID: " + ch.id + ")";
+      document.getElementById("reader-content").textContent = ch.content || "";
+    } catch (err) {
+      showToast("Failed to load chapter: " + err.message);
+    }
+  }
+
+  async function loadParentSection(parentId, bookTitle, chapterId) {
+    try {
+      const data = await apiFetch("/api/parent?id=" + encodeURIComponent(parentId));
+      const p = data.parent;
+      document.getElementById("reader-title").textContent = p.book_title + " — " + p.section_title;
+      document.getElementById("reader-subtitle").textContent =
+        "Promoted Parent Section (" + p.chapter_title + ")";
+
+      const bar = document.getElementById("reader-chapters-bar");
+      bar.replaceChildren();
+      bar.classList.remove("hidden");
+
+      if (chapterId) {
+        const fullChapBtn = el("button", "btn btn-small btn-primary", "Open Full Surrounding Chapter");
+        fullChapBtn.type = "button";
+        fullChapBtn.addEventListener("click", function () {
+          loadChapter(chapterId, bookTitle);
+        });
+        bar.appendChild(fullChapBtn);
+      }
+
+      document.getElementById("reader-content").textContent = p.content || "";
+    } catch (err) {
+      showToast("Failed to load parent section: " + err.message);
+    }
+  }
+
+  async function deleteBook(bookId, title) {
+    try {
+      await apiFetch("/api/books/delete", {
+        method: "POST",
+        body: JSON.stringify({ book_id: bookId }),
+      });
+      showToast("Removed book: " + title);
+      await refreshStatusAndBooks();
+    } catch (err) {
+      showToast("Delete failed: " + err.message);
+    }
+  }
+
+  function createSourceCard(src, idx) {
+    const ck = src.chunk;
+    const card = el("div", "source-card");
+
+    const topRow = el("div", "source-title-row");
+    const badge = el(
+      "strong",
+      "",
+      "[Source " + (idx + 1) + "] " + ck.book_title + " — " + ck.chapter_title + " > " + ck.section_title
+    );
+
+    const btnGroup = el("div", "book-card-actions");
+    if (src.parent_id) {
+      const parentBtn = el(
+        "button",
+        "btn btn-small btn-secondary",
+        "View Parent Section (" + (src.child_hits || 1) + " child hits)"
+      );
+      parentBtn.type = "button";
+      parentBtn.addEventListener("click", function () {
+        loadParentSection(src.parent_id, ck.book_title, ck.chapter_id);
+      });
+      btnGroup.appendChild(parentBtn);
+    }
+
+    const chapBtn = el("button", "btn btn-small btn-secondary", "Read Full Chapter");
+    chapBtn.type = "button";
+    chapBtn.addEventListener("click", function () {
+      loadChapter(ck.chapter_id, ck.book_title);
+    });
+    btnGroup.appendChild(chapBtn);
+
+    topRow.appendChild(badge);
+    topRow.appendChild(btnGroup);
+
+    const meta = el(
+      "div",
+      "muted",
+      "Author: " +
+        ck.author +
+        " | Score: " +
+        Number(src.score || 0).toFixed(4) +
+        " | Promoted Parent Chars: " +
+        (src.parent_text ? src.parent_text.length : ck.text.length)
+    );
+
+    const snippet = el("pre", "source-snippet", src.parent_text || ck.text);
+
+    card.appendChild(topRow);
+    card.appendChild(meta);
+    card.appendChild(snippet);
+    return card;
+  }
+
+  function initEventListeners() {
+    const tabAsk = document.getElementById("tab-ask");
+    const tabSearch = document.getElementById("tab-search");
+    const viewAsk = document.getElementById("view-ask");
+    const viewSearch = document.getElementById("view-search");
+
+    tabAsk.addEventListener("click", function () {
+      tabAsk.classList.add("active");
+      tabSearch.classList.remove("active");
+      viewAsk.classList.remove("hidden");
+      viewSearch.classList.add("hidden");
+    });
+
+    tabSearch.addEventListener("click", function () {
+      tabSearch.classList.add("active");
+      tabAsk.classList.remove("active");
+      viewSearch.classList.remove("hidden");
+      viewAsk.classList.add("hidden");
+    });
+
+    document.getElementById("ask-form").addEventListener("submit", async function (e) {
+      e.preventDefault();
+      const input = document.getElementById("ask-input");
+      const question = input.value.trim();
+      if (!question) return;
+
+      const bookFilter = document.getElementById("book-filter-select").value;
+      const out = document.getElementById("ask-output");
+      out.replaceChildren(el("div", "empty-state", "Running Qdrant Hybrid RRF + Parent-Child promotion + Ollama generation..."));
+
+      try {
+        const res = await apiFetch("/api/ask", {
+          method: "POST",
+          body: JSON.stringify({ question: question, book_filter: bookFilter }),
+        });
+
+        out.replaceChildren();
+        const ansCard = el("div", "answer-card");
+        const header = el(
+          "div",
+          "answer-header",
+          "Model: " + res.model + " • Latency: " + res.duration_ms + " ms"
+        );
+        const body = el("div", "answer-body", res.answer);
+        ansCard.appendChild(header);
+        ansCard.appendChild(body);
+        out.appendChild(ansCard);
+
+        const sources = res.sources || [];
+        if (sources.length > 0) {
+          const srcHeading = el("h3", "muted", "Promoted Parent Sections (" + sources.length + ")");
+          out.appendChild(srcHeading);
+          sources.forEach(function (src, i) {
+            out.appendChild(createSourceCard(src, i));
+          });
+        }
+      } catch (err) {
+        out.replaceChildren(el("div", "empty-state", "Error: " + err.message));
+      }
+    });
+
+    document.getElementById("search-form").addEventListener("submit", async function (e) {
+      e.preventDefault();
+      const query = document.getElementById("search-input").value.trim();
+      if (!query) return;
+
+      const mode = document.getElementById("search-mode").value;
+      const bookFilter = document.getElementById("book-filter-select").value;
+      const out = document.getElementById("search-output");
+      out.replaceChildren(el("div", "empty-state", "Searching Qdrant & promoting Parent Sections..."));
+
+      try {
+        const res = await apiFetch("/api/search", {
+          method: "POST",
+          body: JSON.stringify({ query: query, mode: mode, book_filter: bookFilter }),
+        });
+        out.replaceChildren();
+        const results = res.results || [];
+        if (results.length === 0) {
+          out.appendChild(el("div", "empty-state", "No matching sections found."));
+          return;
+        }
+        results.forEach(function (src, i) {
+          out.appendChild(createSourceCard(src, i));
+        });
+      } catch (err) {
+        out.replaceChildren(el("div", "empty-state", "Search failed: " + err.message));
+      }
+    });
+
+    document.getElementById("btn-ingest").addEventListener("click", async function () {
+      const btn = document.getElementById("btn-ingest");
+      btn.disabled = true;
+      btn.textContent = "Scanning...";
+      try {
+        const rep = await apiFetch("/api/ingest", {
+          method: "POST",
+          body: JSON.stringify({ force: false }),
+        });
+        showToast(
+          "Indexed " +
+            rep.indexed_books +
+            " new books (" +
+            rep.total_parents +
+            " parent sections, " +
+            rep.total_chunks +
+            " child chunks, skipped " +
+            rep.skipped_books +
+            " unchanged)."
+        );
+        await refreshStatusAndBooks();
+      } catch (err) {
+        showToast("Ingest error: " + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Scan Books Dir";
+      }
+    });
+
+    document.getElementById("epub-upload-input").addEventListener("change", async function (e) {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      const formData = new FormData();
+      formData.append("epub", file);
+      showToast("Uploading & indexing " + file.name + "...");
+      try {
+        const rep = await apiFetch("/api/upload", {
+          method: "POST",
+          body: formData,
+        });
+        showToast(
+          "Uploaded " +
+            rep.original_name +
+            " (" +
+            rep.parents_count +
+            " parent sections, " +
+            rep.chunks_count +
+            " child chunks)."
+        );
+        await refreshStatusAndBooks();
+      } catch (err) {
+        showToast("Upload failed: " + err.message);
+      } finally {
+        e.target.value = "";
+      }
+    });
+
+    const modal = document.getElementById("settings-modal");
+    document.getElementById("btn-settings").addEventListener("click", function () {
+      modal.classList.remove("hidden");
+    });
+    document.getElementById("btn-close-settings").addEventListener("click", function () {
+      modal.classList.add("hidden");
+    });
+
+    document.getElementById("settings-form").addEventListener("submit", async function (e) {
+      e.preventDefault();
+      const payload = {
+        books_dir: document.getElementById("cfg-books-dir").value.trim(),
+        qdrant_url: document.getElementById("cfg-qdrant-url").value.trim(),
+        ollama_url: document.getElementById("cfg-ollama-url").value.trim(),
+        embedding_model: document.getElementById("cfg-embed-model").value.trim(),
+        chat_model: document.getElementById("cfg-chat-model").value.trim(),
+        parent_chunk_size: parseInt(document.getElementById("cfg-parent-size").value, 10) || 3200,
+        child_chunk_size: parseInt(document.getElementById("cfg-child-size").value, 10) || 650,
+        top_k: parseInt(document.getElementById("cfg-top-k").value, 10) || 6,
+      };
+      try {
+        await apiFetch("/api/config", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        modal.classList.add("hidden");
+        showToast("Configuration saved.");
+        await refreshStatusAndBooks();
+      } catch (err) {
+        showToast("Failed to save settings: " + err.message);
+      }
+    });
+
+    document.getElementById("btn-sync-qdrant").addEventListener("click", async function () {
+      try {
+        await apiFetch("/api/qdrant/sync", { method: "POST", body: "{}" });
+        showToast("Synchronized local catalog chunks to Qdrant.");
+        await refreshStatusAndBooks();
+      } catch (err) {
+        showToast("Qdrant sync error: " + err.message);
+      }
+    });
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    initEventListeners();
+    refreshStatusAndBooks();
+  });
+})();
+

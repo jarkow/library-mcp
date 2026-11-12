@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="csrf-token" content="__CSRF_TOKEN__">
+  <title>Smart Library — Technical EPUB RAG (Go + Qdrant)</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-badge">GO + QDRANT</span>
+      <h1>Smart Library</h1>
+      <span class="subtitle">Parent-Child Hierarchical RAG for Technical EPUBs</span>
+    </div>
+    <div class="status-bar">
+      <span id="qdrant-pill" class="pill pill-neutral">Qdrant: checking...</span>
+      <span id="ollama-pill" class="pill pill-neutral">Ollama: checking...</span>
+      <span id="stats-pill" class="pill pill-info">0 Books | 0 Parents | 0 Chunks</span>
+      <button id="btn-ingest" class="btn btn-primary" type="button">Scan Books Dir</button>
+      <button id="btn-settings" class="btn btn-secondary" type="button">Settings</button>
+    </div>
+  </header>
+
+  <div id="toast-banner" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <main class="workspace">
+    <!-- Left Sidebar: Indexed Books & Upload -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h2>Library Catalog</h2>
+        <label class="btn btn-small btn-secondary" for="epub-upload-input">
+          + Upload EPUB
+          <input id="epub-upload-input" type="file" accept=".epub" class="visually-hidden">
+        </label>
+      </div>
+      <div class="filter-box">
+        <label for="book-filter-select">Filter Search / Q&amp;A by Book:</label>
+        <select id="book-filter-select" class="input-control">
+          <option value="">All Indexed Books</option>
+        </select>
+      </div>
+      <div id="books-list" class="books-list"></div>
+    </aside>
+
+    <!-- Center Panel: RAG Ask AI & Hybrid Search -->
+    <section class="center-panel">
+      <nav class="tabs">
+        <button id="tab-ask" class="tab active" type="button">Ask AI (Hierarchical RAG)</button>
+        <button id="tab-search" class="tab" type="button">Qdrant Hybrid Search</button>
+      </nav>
+
+      <!-- Ask AI View -->
+      <div id="view-ask" class="tab-view">
+        <form id="ask-form" class="query-bar">
+          <input id="ask-input" type="text" class="input-control" placeholder="Ask a technical question across your EPUB books (e.g., How do B-Trees compare to LSM-Trees?)..." required>
+          <button id="ask-submit" class="btn btn-primary" type="submit">Ask Library</button>
+        </form>
+        <div id="ask-output" class="output-area">
+          <div class="empty-state">
+            <h3>Ask your technical library anything</h3>
+            <p>Queries match fine-grained child chunks in Qdrant (Dense + Sparse RRF) and automatically promote full Parent Sections (complete code blocks &amp; context) to your local Ollama LLM.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hybrid Search View -->
+      <div id="view-search" class="tab-view hidden">
+        <form id="search-form" class="query-bar">
+          <input id="search-input" type="text" class="input-control" placeholder="Search functions, CLI flags, concepts, or code snippets..." required>
+          <select id="search-mode" class="input-control mode-select">
+            <option value="hybrid">Hybrid RRF (Dense + Sparse)</option>
+            <option value="semantic">Dense Vector Only</option>
+            <option value="keyword">Sparse / Keyword BM25</option>
+          </select>
+          <button id="search-submit" class="btn btn-primary" type="submit">Search</button>
+        </form>
+        <div id="search-output" class="output-area"></div>
+      </div>
+    </section>
+
+    <!-- Right Panel: Parent Section & Full Chapter Reader -->
+    <aside class="reader-panel">
+      <div class="reader-header">
+        <div>
+          <h2 id="reader-title">Section &amp; Chapter Reader</h2>
+          <p id="reader-subtitle" class="muted">Click any citation, search result, or book chapter to inspect the full text.</p>
+        </div>
+      </div>
+      <div id="reader-chapters-bar" class="chapters-bar hidden"></div>
+      <article id="reader-content" class="reader-content"></article>
+    </aside>
+  </main>
+
+  <!-- Settings Modal -->
+  <div id="settings-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2 id="settings-title">Smart Library Configuration</h2>
+        <button id="btn-close-settings" class="btn btn-small btn-secondary" type="button">Close</button>
+      </div>
+      <form id="settings-form" class="modal-body">
+        <div class="form-group">
+          <label for="cfg-books-dir">Books Directory Path (supports Windows paths like H:\Books on WSL)</label>
+          <input id="cfg-books-dir" type="text" class="input-control" required>
+          <small id="cfg-resolved-dir" class="muted"></small>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="cfg-qdrant-url">Qdrant Server URL</label>
+            <input id="cfg-qdrant-url" type="url" class="input-control" required>
+          </div>
+          <div class="form-group">
+            <label for="cfg-ollama-url">Ollama Server URL</label>
+            <input id="cfg-ollama-url" type="url" class="input-control" required>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="cfg-embed-model">Embedding Model (Ollama)</label>
+            <input id="cfg-embed-model" type="text" class="input-control" required>
+          </div>
+          <div class="form-group">
+            <label for="cfg-chat-model">Chat LLM Model (Ollama)</label>
+            <input id="cfg-chat-model" type="text" class="input-control" required>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="cfg-parent-size">Parent Section Size (chars)</label>
+            <input id="cfg-parent-size" type="number" min="1000" max="12000" class="input-control" required>
+          </div>
+          <div class="form-group">
+            <label for="cfg-child-size">Child Chunk Size (chars)</label>
+            <input id="cfg-child-size" type="number" min="250" max="2500" class="input-control" required>
+          </div>
+          <div class="form-group">
+            <label for="cfg-top-k">Top-K Parent Sections</label>
+            <input id="cfg-top-k" type="number" min="1" max="30" class="input-control" required>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="btn-sync-qdrant" class="btn btn-secondary" type="button">Sync Catalog to Qdrant</button>
+          <button class="btn btn-primary" type="submit">Save Configuration</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/static/app.js" nonce="__CSP_NONCE__"></script>
+</body>
+</html>
+

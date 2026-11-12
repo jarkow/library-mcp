@@ -1,0 +1,19 @@
+# Binaries
+smart-lib
+smart-lib.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Runtime data & Qdrant volumes
+data/
+*.db
+*.bin
+.session_secret
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
