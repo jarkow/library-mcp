@@ -1,6 +1,6 @@
 # Library MCP
 
-**Library MCP** is a 100% local, structure-aware **Parent-Child Hierarchical RAG** engine and **Model Context Protocol (MCP)** server for technical books (`.epub`, `.pdf`, `.mobi`, `.azw`, `.azw3`). Written in pure **Go** with zero external Go module dependencies, it turns your personal ebook folder into a searchable, cited knowledge base that AI coding assistants (Antigravity, Claude Desktop, Claude Code, Cursor) and humans (via CLI or Web UI) can query in real time.
+**Library MCP** is a 100% local, structure-aware **Parent-Child Hierarchical RAG** engine and **Model Context Protocol (MCP)** server for technical books (`.epub`, `.pdf`, `.mobi`, `.azw`, `.azw3`). Written in pure **Go** (`CGO_ENABLED=0` with pure-Go SQLite + FTS5), it turns your personal ebook folder into a searchable, cited knowledge base that AI coding assistants (Antigravity, Claude Desktop, Claude Code, Cursor) and humans (via CLI or Web UI) can query in real time.
 
 ---
 
@@ -20,13 +20,13 @@ Standard naive RAG pipelines split books into fixed 500-character slices. For te
    - At query time, searches match fine-grained **Child Chunks**, then **promote and deduplicate** hits to their **Parent Sections**—boosting parent sections where multiple child chunks match (`score += child_score * 0.20`) so the AI receives complete context instead of fragmented snippets.
 3. **Qdrant Hybrid Search (Dense + Sparse RRF) with Resilient Local Fallback**:
    - Indexes both **Dense embeddings** (via local Ollama `bge-m3`) and **Sparse BM25 vectors** (with technical tokenization that preserves identifiers like `io.LimitReader`, `C++`, `UTF-8`, `bge-m3`) into **Qdrant** using Reciprocal Rank Fusion (RRF).
-   - Maintains a synchronized local catalog (`data/library_index.json` and `data/vectors.bin`) with an in-memory BM25 + cosine similarity engine so search and MCP tools keep working seamlessly even if Docker/Qdrant or Ollama is offline.
+   - Maintains a synchronized local **SQLite + FTS5** database (`data/library.db`) and vector cache (`data/vectors.bin`) so full-text search, chapter/TOC queries, and MCP tools run in milliseconds and keep working seamlessly even if Docker/Qdrant or Ollama is offline.
 4. **Automatic Web Metadata Enrichment, Categorization & Tagging**:
    - Extracts embedded OPF/EXTH/PDF metadata and ISBNs, then queries **Google Books** and **Open Library** to populate canonical **Title, Subtitle, Author, Publisher, Published Year, ISBN-13, Page Count, Description, Cover URL, and Web URL**.
    - Classifies every book into a primary **Category** (`AI & Machine Learning`, `Security & Cryptography`, `Software Architecture & Design`, `Software Engineering & DevOps`, `Data Engineering & Databases`, `Systems & Networking`) and assigns up to 8 normalized technical **Tags** (`rag`, `llm`, `domain-driven-design`, `xss`, `ci-cd`, etc.) using book metadata, chapter titles, and parent folder names.
 5. **Three Interfaces in One Binary**:
-   - **MCP Server (`library-mcp mcp`)**: Exposes **12 MCP Tools** (`search_books`, `list_books`, `get_book_toc`, `search_chapters`, `get_chapter`, `compare_books_on_topic`, `extract_code_examples`, `deduplicate_books`, `save_note`, `list_notes`, `delete_note`, `export_dossier`, `enrich_books`, `remove_book`), **MCP Resources** (`resources/list`, `resources/read`), and **MCP Prompts** (`prompts/list`, `prompts/get`) over `stdio` JSON-RPC 2.0.
-   - **Command-Line Interface (`library-mcp <cmd>`)**: Fast CLI (<10ms cold start via `catalog_meta.json` + binary `corpus.gob`) for ingesting, enriching, searching, comparing books, extracting code examples, deduplicating editions, managing notes, exporting study dossiers, watching folders, and syncing to Qdrant.
+   - **MCP Server (`library-mcp mcp`)**: Exposes **14 MCP Tools** (`search_books`, `list_books`, `get_book_toc`, `search_chapters`, `get_chapter`, `compare_books_on_topic`, `extract_code_examples`, `deduplicate_books`, `save_note`, `list_notes`, `delete_note`, `export_dossier`, `enrich_books`, `remove_book`, `ingest_books`, `ask_library`), **MCP Resources** (`resources/list`, `resources/read`), and **MCP Prompts** (`prompts/list`, `prompts/get`) over `stdio` JSON-RPC 2.0.
+   - **Command-Line Interface (`library-mcp <cmd>`)**: Fast CLI (<15ms cold start backed by SQLite `data/library.db` + FTS5) for ingesting, enriching, searching, comparing books, extracting code examples, deduplicating editions, managing notes, exporting study dossiers, watching folders, and syncing to Qdrant.
    - **Local Web UI (`library-mcp serve`)**: Dark-mode three-pane research interface (`http://127.0.0.1:8765`) with live background folder watcher, book catalog, hybrid search, RAG Q&A, study notes & dossier generator, and a full chapter reader.
 
 ---
@@ -49,7 +49,7 @@ flowchart LR
 
     subgraph Storage["Hybrid Storage Layer"]
         QD[("Qdrant Vector DB\nDense (bge-m3) + Sparse (IDF)")]
-        LOC[("Local Catalog\ndata/library_index.json\ndata/vectors.bin")]
+        LOC[("SQLite + FTS5 Catalog\ndata/library.db\ndata/vectors.bin")]
     end
 
     subgraph Consumers["Interfaces"]
@@ -76,8 +76,8 @@ All runtime data is stored inside the `./data` folder of the repository:
 | Path | Description |
 | :--- | :--- |
 | `data/qdrant_storage/` | **Qdrant Vector Database storage volume** mounted into the `library-mcp-qdrant` container (`/qdrant/storage`). Holds Qdrant's collections, HNSW dense vector indexes, sparse inverted indexes, and payloads. |
-| `data/catalog_meta.json` | Fast lightweight catalog index containing all `Books` (metadata, categories, tags), `Notes` (bookmarks & takeaways), and corpus summary counts for instant (<10ms) CLI & MCP startup. |
-| `data/corpus.gob` | High-speed binary Gob store containing all `Chapters` (full chapter text), `Parents` (~3,200-char parent sections), and `Chunks` (~650-char child chunks), loaded lazily on demand. |
+| `data/library.db` | **SQLite + FTS5 Database** (`WAL` mode) storing all `books`, `chapters`, `parents` (~3,200-char parent sections), `chunks` (~650-char child chunks), `notes`, and the `chunks_fts` full-text search index for sub-50ms queries with minimal RAM usage. |
+| `data/catalog_meta.json` | Lightweight JSON snapshot of book metadata, categories, tags, and notes for quick inspection. |
 | `data/vectors.bin` | Local binary float32 embedding cache. Allows instant offline vector search and lets you push all indexed chunks to Qdrant anytime via `library-mcp sync`. |
 | `data/uploads/` | Books uploaded directly through the Web UI. |
 

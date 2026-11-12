@@ -41,6 +41,7 @@ func TestRecursiveDirectoryIngestion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer st.Close()
 	eng := NewEngine(cfg, st)
 	// Avoid external network calls in unit tests
 	eng.enricher.GoogleBaseURL = ""

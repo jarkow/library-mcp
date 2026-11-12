@@ -45,6 +45,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error opening library store: %v\n", err)
 		os.Exit(1)
 	}
+	defer st.Close()
 	engine := rag.NewEngine(cfg, st)
 	ctx := context.Background()
 

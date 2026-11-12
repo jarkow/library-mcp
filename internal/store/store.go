@@ -2,8 +2,7 @@ package store
 
 import (
 	"context"
-	"encoding/binary"
-	"encoding/gob"
+	"database/sql"
 	"errors"
 	"io"
 	"log"
@@ -69,11 +68,14 @@ type persistedData struct {
 	Chunks   []epub.ParsedChunk            `json:"chunks"`
 }
 
-// Store coordinates Qdrant hybrid vector/sparse search with the local ParentSection & Chapter catalog.
+// Store coordinates Qdrant hybrid vector/sparse search with the local SQLite (data/library.db) ParentSection & Chapter catalog.
 type Store struct {
 	mu      sync.RWMutex
 	dataDir string
 	qdrant  *qdrant.Client
+	db      *sql.DB
+
+	ftsEnabled bool
 
 	books    map[string]BookRecord
 	notes    map[string]NoteRecord
@@ -133,14 +135,13 @@ func (s *Store) vectorsPath() string {
 func (s *Store) load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.loadCatalogFastLocked()
+	return s.initSQLiteLocked()
 }
 
 // Save writes the catalog and vectors atomically to disk.
 func (s *Store) Save() error {
-	s.ensureCorpusLoaded()
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.saveLocked()
 }
 
@@ -151,77 +152,21 @@ func (s *Store) SetBatchMode(enabled bool) {
 	s.batchMode = enabled
 }
 
-// Flush rebuilds the in-memory BM25 index and saves the catalog and vectors to disk.
+// Flush rebuilds the in-memory BM25 index (if loaded) and flushes SQLite state.
 func (s *Store) Flush() error {
-	s.ensureCorpusLoaded()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.batchMode = false
-	s.rebuildBM25Locked()
-	return s.saveLocked()
+	if s.corpusLoaded {
+		s.rebuildBM25Locked()
+	}
+	s.updateCachedCountsLocked()
+	return nil
 }
 
 func (s *Store) saveLocked() error {
-	if err := s.saveCatalogMetaLocked(); err != nil {
-		return err
-	}
-	if !s.corpusLoaded {
-		return nil
-	}
-
-	tmpCorpus := s.corpusPath() + ".tmp"
-	cf, err := os.OpenFile(tmpCorpus, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	bcd := binaryCorpusData{
-		Chapters: s.chapters,
-		Parents:  s.parents,
-		Chunks:   s.chunks,
-	}
-	if err := gob.NewEncoder(cf).Encode(&bcd); err != nil {
-		cf.Close()
-		return err
-	}
-	if err := cf.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpCorpus, s.corpusPath()); err != nil {
-		return err
-	}
-	_ = os.Remove(s.indexPath())
-
-	tmpVec := s.vectorsPath() + ".tmp"
-	vf, err := os.OpenFile(tmpVec, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	count := uint32(len(s.chunks))
-	if err := binary.Write(vf, binary.LittleEndian, count); err != nil {
-		vf.Close()
-		return err
-	}
-	for i := 0; i < len(s.chunks); i++ {
-		var vec []float32
-		if i < len(s.vectors) {
-			vec = s.vectors[i]
-		}
-		dim := uint32(len(vec))
-		if err := binary.Write(vf, binary.LittleEndian, dim); err != nil {
-			vf.Close()
-			return err
-		}
-		if dim > 0 {
-			if err := binary.Write(vf, binary.LittleEndian, vec); err != nil {
-				vf.Close()
-				return err
-			}
-		}
-	}
-	if err := vf.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpVec, s.vectorsPath())
+	s.updateCachedCountsLocked()
+	return nil
 }
 
 // HasFileHash returns true if a book with the given SHA-256 hash is already indexed.
@@ -236,9 +181,8 @@ func (s *Store) HasFileHash(fileHash string) bool {
 	return false
 }
 
-// UpsertBook indexes child chunks into Qdrant and saves ParentSections & Chapters in the local catalog.
+// UpsertBook indexes child chunks into Qdrant and saves ParentSections & Chapters in the local SQLite database.
 func (s *Store) UpsertBook(ctx context.Context, book *epub.ParsedBook, embeddings [][]float32) error {
-	s.ensureCorpusLoaded()
 	normEmbeddings := make([][]float32, len(book.Chunks))
 	for i := range book.Chunks {
 		if i < len(embeddings) && len(embeddings[i]) > 0 {
@@ -259,8 +203,6 @@ func (s *Store) UpsertBook(ctx context.Context, book *epub.ParsedBook, embedding
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.deleteBookLocked(book.ID)
 
 	rec := BookRecord{
 		ID:             book.ID,
@@ -288,24 +230,30 @@ func (s *Store) UpsertBook(ctx context.Context, book *epub.ParsedBook, embedding
 		ChunkCount:     len(book.Chunks),
 		IndexedAt:      time.Now().UTC().Format(time.RFC3339),
 	}
+
+	if err := s.upsertBookSQLiteLocked(rec, book, normEmbeddings); err != nil {
+		return err
+	}
+
+	if s.corpusLoaded {
+		s.deleteBookLocked(book.ID)
+		for _, ch := range book.Chapters {
+			s.chapters[ch.ID] = ch
+		}
+		for _, p := range book.Parents {
+			s.parents[p.ID] = p
+		}
+		for i, ck := range book.Chunks {
+			s.chunks = append(s.chunks, ck)
+			s.vectors = append(s.vectors, normEmbeddings[i])
+		}
+		if !s.batchMode {
+			s.rebuildBM25Locked()
+		}
+	}
 	s.books[book.ID] = rec
-
-	for _, ch := range book.Chapters {
-		s.chapters[ch.ID] = ch
-	}
-	for _, p := range book.Parents {
-		s.parents[p.ID] = p
-	}
-	for i, ck := range book.Chunks {
-		s.chunks = append(s.chunks, ck)
-		s.vectors = append(s.vectors, normEmbeddings[i])
-	}
-
-	if s.batchMode {
-		return nil
-	}
-	s.rebuildBM25Locked()
-	return s.saveLocked()
+	s.updateCachedCountsLocked()
+	return nil
 }
 
 // SyncAllToQdrant pushes all locally cataloged chunks and vectors into Qdrant (useful if Qdrant was started after ingestion).
@@ -329,13 +277,12 @@ func (s *Store) DeleteBook(ctx context.Context, bookID string) error {
 	return err
 }
 
-// RemoveBook resolves a book by exact ID, ISBN, exact title/filename, or unique title substring and removes it from Qdrant and the local catalog.
+// RemoveBook resolves a book by exact ID, ISBN, exact title/filename, or unique title substring and removes it from Qdrant and SQLite.
 func (s *Store) RemoveBook(ctx context.Context, idOrQuery string) (BookRecord, error) {
 	matched, err := s.ResolveBook(idOrQuery)
 	if err != nil {
 		return BookRecord{}, err
 	}
-	s.ensureCorpusLoaded()
 
 	s.mu.RLock()
 	qc := s.qdrant
@@ -348,11 +295,17 @@ func (s *Store) RemoveBook(ctx context.Context, idOrQuery string) (BookRecord, e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.deleteBookLocked(matched.ID)
-	s.rebuildBM25Locked()
-	if err := s.saveLocked(); err != nil {
+	if err := s.deleteBookSQLiteLocked(matched.ID); err != nil {
 		return matched, err
 	}
+	delete(s.books, matched.ID)
+	if s.corpusLoaded {
+		s.deleteBookLocked(matched.ID)
+		if !s.batchMode {
+			s.rebuildBM25Locked()
+		}
+	}
+	s.updateCachedCountsLocked()
 	return matched, nil
 }
 
@@ -511,10 +464,7 @@ func (s *Store) UpdateBookMetadata(bookID string, meta metadata.BookMetadata) (B
 	}
 
 	s.books[bookID] = rec
-	if s.batchMode {
-		return rec, nil
-	}
-	if err := s.saveLocked(); err != nil {
+	if err := s.updateBookMetadataSQLiteLocked(rec); err != nil {
 		return rec, err
 	}
 	return rec, nil
@@ -522,14 +472,22 @@ func (s *Store) UpdateBookMetadata(bookID string, meta metadata.BookMetadata) (B
 
 // GetBook returns a book record and its ordered chapters (without full content for fast listing).
 func (s *Store) GetBook(bookID string) (BookRecord, []epub.ParsedChapter, bool) {
-	s.ensureCorpusLoaded()
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	b, ok := s.books[bookID]
+	loaded := s.corpusLoaded
+	s.mu.RUnlock()
 	if !ok {
 		return BookRecord{}, nil, false
 	}
+	if !loaded {
+		if chaps, okSQL := s.getChaptersMetadataFromSQLite(bookID); okSQL {
+			return b, chaps, true
+		}
+	}
+
+	s.ensureCorpusLoaded()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var chaps []epub.ParsedChapter
 	for _, ch := range s.chapters {
 		if ch.BookID == bookID {
@@ -546,22 +504,26 @@ func (s *Store) GetBook(bookID string) (BookRecord, []epub.ParsedChapter, bool) 
 
 // GetChapter returns the full chapter including content by chapter ID.
 func (s *Store) GetChapter(chapterID string) (epub.ParsedChapter, bool) {
-	s.ensureCorpusLoaded()
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	ch, ok := s.chapters[chapterID]
-	return ch, ok
+	if s.corpusLoaded {
+		ch, ok := s.chapters[chapterID]
+		s.mu.RUnlock()
+		return ch, ok
+	}
+	s.mu.RUnlock()
+	return s.getChapterFromSQLite(chapterID)
 }
 
 // GetParentSection returns the full ParentSection by parent ID.
 func (s *Store) GetParentSection(parentID string) (epub.ParentSection, bool) {
-	s.ensureCorpusLoaded()
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	p, ok := s.parents[parentID]
-	return p, ok
+	if s.corpusLoaded {
+		p, ok := s.parents[parentID]
+		s.mu.RUnlock()
+		return p, ok
+	}
+	s.mu.RUnlock()
+	return s.getParentFromSQLite(parentID)
 }
 
 // Stats returns total counts of indexed books, chapters, parent sections, child chunks, and vectors.

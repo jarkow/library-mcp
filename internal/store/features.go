@@ -173,7 +173,7 @@ func (s *Store) ensureCorpusLoaded() {
 	if s.corpusLoaded {
 		return
 	}
-	_ = s.loadFullCorpusLocked()
+	_ = s.loadCorpusFromSQLiteLocked()
 }
 
 func (s *Store) loadFullCorpusLocked() error {
@@ -357,6 +357,9 @@ func (s *Store) GetBookTOC(idOrQuery string) (*BookTOC, error) {
 	if err != nil {
 		return nil, err
 	}
+	if toc, ok := s.getBookTOCFromSQLite(rec); ok {
+		return toc, nil
+	}
 	s.ensureCorpusLoaded()
 
 	s.mu.RLock()
@@ -411,7 +414,6 @@ func (s *Store) GetBookTOC(idOrQuery string) (*BookTOC, error) {
 
 // SearchChapters searches across all chapter titles, parent section headings, and opening summaries.
 func (s *Store) SearchChapters(query, bookFilter, category, tag string, topK int) []ChapterSearchHit {
-	s.ensureCorpusLoaded()
 	if topK <= 0 {
 		topK = 15
 	}
@@ -423,67 +425,125 @@ func (s *Store) SearchChapters(query, bookFilter, category, tag string, topK int
 	}
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	allowedBooks := s.matchingBookIDsLocked(SearchOptions{
 		BookFilter: bookFilter,
 		Category:   category,
 		Tag:        tag,
 	})
+	booksCopy := make(map[string]BookRecord, len(s.books))
+	for k, v := range s.books {
+		booksCopy[k] = v
+	}
+	db := s.db
+	s.mu.RUnlock()
 
 	var hits []ChapterSearchHit
 
-	for _, p := range s.parents {
-		if allowedBooks != nil && !allowedBooks[p.BookID] {
-			continue
-		}
-		book := s.books[p.BookID]
-		chapTitleLower := strings.ToLower(p.ChapterTitle)
-		secTitleLower := strings.ToLower(p.SectionTitle)
-		headingText := chapTitleLower + " " + secTitleLower
-
-		score := 0.0
-		if strings.Contains(secTitleLower, lowerQ) {
-			score += 12.0
-		}
-		if strings.Contains(chapTitleLower, lowerQ) {
-			score += 8.0
-		}
-		for _, tok := range qTokens {
-			if strings.Contains(secTitleLower, tok) {
-				score += 4.0
+	if db != nil {
+		rows, err := db.Query(`SELECT p.id, p.book_id, p.chapter_id, p.book_title, p.author, p.chapter_title, p.section_title, substr(p.content, 1, 260), IFNULL(c.chapter_index, 0)
+			FROM parents p LEFT JOIN chapters c ON c.id = p.chapter_id`)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var pID, bookID, chapID, bookTitle, author, chapTitle, secTitle, snippet string
+				var chapIdx int
+				if rows.Scan(&pID, &bookID, &chapID, &bookTitle, &author, &chapTitle, &secTitle, &snippet, &chapIdx) != nil {
+					continue
+				}
+				if allowedBooks != nil && !allowedBooks[bookID] {
+					continue
+				}
+				chapTitleLower := strings.ToLower(chapTitle)
+				secTitleLower := strings.ToLower(secTitle)
+				score := 0.0
+				if strings.Contains(secTitleLower, lowerQ) {
+					score += 12.0
+				}
+				if strings.Contains(chapTitleLower, lowerQ) {
+					score += 8.0
+				}
+				for _, tok := range qTokens {
+					if strings.Contains(secTitleLower, tok) {
+						score += 4.0
+					}
+					if strings.Contains(chapTitleLower, tok) {
+						score += 2.5
+					}
+				}
+				if score == 0 {
+					continue
+				}
+				book := booksCopy[bookID]
+				snippet = strings.TrimSpace(snippet)
+				if len(snippet) >= 255 {
+					snippet += "..."
+				}
+				hits = append(hits, ChapterSearchHit{
+					BookID:       bookID,
+					BookTitle:    bookTitle,
+					Author:       author,
+					Category:     book.Category,
+					ChapterID:    chapID,
+					ChapterIndex: chapIdx,
+					ChapterTitle: chapTitle,
+					ParentID:     pID,
+					SectionTitle: secTitle,
+					Snippet:      snippet,
+					Score:        score,
+				})
 			}
-			if strings.Contains(chapTitleLower, tok) {
-				score += 2.5
+		}
+	} else {
+		s.ensureCorpusLoaded()
+		s.mu.RLock()
+		for _, p := range s.parents {
+			if allowedBooks != nil && !allowedBooks[p.BookID] {
+				continue
 			}
+			book := s.books[p.BookID]
+			chapTitleLower := strings.ToLower(p.ChapterTitle)
+			secTitleLower := strings.ToLower(p.SectionTitle)
+			score := 0.0
+			if strings.Contains(secTitleLower, lowerQ) {
+				score += 12.0
+			}
+			if strings.Contains(chapTitleLower, lowerQ) {
+				score += 8.0
+			}
+			for _, tok := range qTokens {
+				if strings.Contains(secTitleLower, tok) {
+					score += 4.0
+				}
+				if strings.Contains(chapTitleLower, tok) {
+					score += 2.5
+				}
+			}
+			if score == 0 {
+				continue
+			}
+			snippet := strings.TrimSpace(p.Content)
+			if len(snippet) > 260 {
+				snippet = snippet[:260] + "..."
+			}
+			chapIdx := 0
+			if ch, ok := s.chapters[p.ChapterID]; ok {
+				chapIdx = ch.ChapterIndex
+			}
+			hits = append(hits, ChapterSearchHit{
+				BookID:       p.BookID,
+				BookTitle:    p.BookTitle,
+				Author:       p.Author,
+				Category:     book.Category,
+				ChapterID:    p.ChapterID,
+				ChapterIndex: chapIdx,
+				ChapterTitle: p.ChapterTitle,
+				ParentID:     p.ID,
+				SectionTitle: p.SectionTitle,
+				Snippet:      snippet,
+				Score:        score,
+			})
 		}
-		if score == 0 {
-			continue
-		}
-		_ = headingText
-
-		snippet := strings.TrimSpace(p.Content)
-		if len(snippet) > 260 {
-			snippet = snippet[:260] + "..."
-		}
-		chapIdx := 0
-		if ch, ok := s.chapters[p.ChapterID]; ok {
-			chapIdx = ch.ChapterIndex
-		}
-
-		hits = append(hits, ChapterSearchHit{
-			BookID:       p.BookID,
-			BookTitle:    p.BookTitle,
-			Author:       p.Author,
-			Category:     book.Category,
-			ChapterID:    p.ChapterID,
-			ChapterIndex: chapIdx,
-			ChapterTitle: p.ChapterTitle,
-			ParentID:     p.ID,
-			SectionTitle: p.SectionTitle,
-			Snippet:      snippet,
-			Score:        score,
-		})
+		s.mu.RUnlock()
 	}
 
 	sort.Slice(hits, func(i, j int) bool {
@@ -514,8 +574,6 @@ func (s *Store) SearchChapters(query, bookFilter, category, tag string, topK int
 
 // SearchWithOptions executes hybrid/keyword/semantic retrieval with category, tag, author, year, code-only, and MMR per-book diversity filtering.
 func (s *Store) SearchWithOptions(ctx context.Context, queryVec []float32, opts SearchOptions) []SearchResult {
-	s.ensureCorpusLoaded()
-
 	if opts.TopK <= 0 {
 		opts.TopK = 6
 	}
@@ -557,6 +615,14 @@ func (s *Store) SearchWithOptions(ctx context.Context, queryVec []float32, opts 
 		}
 	}
 
+	// Fast SQLite FTS5 path when no dense query vector is present
+	if len(normQueryVec) == 0 && (opts.Mode == "hybrid" || opts.Mode == "keyword") {
+		if ftsHits, ok := s.searchFTS5(opts, candidatePoolSize); ok {
+			return s.promoteToParentsWithOptions(ftsHits, opts)
+		}
+	}
+
+	s.ensureCorpusLoaded()
 	childResults := s.searchLocalWithOptions(opts, normQueryVec, candidatePoolSize)
 	return s.promoteToParentsWithOptions(childResults, opts)
 }
@@ -667,6 +733,8 @@ func (s *Store) promoteToParentsWithOptions(childHits []SearchResult, opts Searc
 			parentText := hit.Chunk.Text
 			if parentSec, ok := s.parents[pID]; ok && parentSec.Content != "" {
 				parentText = parentSec.Content
+			} else if parentSecSQL, okSQL := s.getParentFromSQLite(pID); okSQL && parentSecSQL.Content != "" {
+				parentText = parentSecSQL.Content
 			}
 			if opts.CodeOnly && scoreCodeDensity(parentText) <= 0 {
 				continue
@@ -1033,19 +1101,12 @@ func (s *Store) DeduplicateBooks(ctx context.Context, apply bool) (*DedupReport,
 		return report, nil
 	}
 
-	s.ensureCorpusLoaded()
 	s.SetBatchMode(true)
 	for _, g := range groups {
 		for _, dup := range g.Duplicates {
-			s.mu.RLock()
-			qc := s.qdrant
-			s.mu.RUnlock()
-			if qc != nil {
-				_ = qc.DeleteByBookID(ctx, dup.ID)
+			if _, err := s.RemoveBook(ctx, dup.ID); err != nil {
+				return report, err
 			}
-			s.mu.Lock()
-			s.deleteBookLocked(dup.ID)
-			s.mu.Unlock()
 			report.RemovedBooks = append(report.RemovedBooks, dup)
 		}
 	}
@@ -1070,7 +1131,6 @@ func (s *Store) SaveNote(note NoteRecord) (NoteRecord, error) {
 		}
 	}
 	if strings.TrimSpace(note.ChapterID) != "" {
-		s.ensureCorpusLoaded()
 		if ch, ok := s.GetChapter(strings.TrimSpace(note.ChapterID)); ok {
 			note.ChapterID = ch.ID
 			note.ChapterTitle = ch.Title
@@ -1084,7 +1144,6 @@ func (s *Store) SaveNote(note NoteRecord) (NoteRecord, error) {
 		}
 	}
 	if strings.TrimSpace(note.ParentID) != "" {
-		s.ensureCorpusLoaded()
 		if p, ok := s.GetParentSection(strings.TrimSpace(note.ParentID)); ok {
 			note.ParentID = p.ID
 			note.SectionTitle = p.SectionTitle
@@ -1126,7 +1185,7 @@ func (s *Store) SaveNote(note NoteRecord) (NoteRecord, error) {
 	}
 
 	s.notes[note.ID] = note
-	if err := s.saveCatalogMetaLocked(); err != nil {
+	if err := s.saveNoteSQLiteLocked(note); err != nil {
 		return note, err
 	}
 	return note, nil
@@ -1197,7 +1256,7 @@ func (s *Store) DeleteNote(noteID string) (NoteRecord, error) {
 		return NoteRecord{}, fmt.Errorf("note %q not found", id)
 	}
 	delete(s.notes, id)
-	if err := s.saveCatalogMetaLocked(); err != nil {
+	if err := s.deleteNoteSQLiteLocked(id); err != nil {
 		return n, err
 	}
 	return n, nil

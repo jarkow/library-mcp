@@ -13,6 +13,7 @@ func TestParentChildPromotionAndHybridFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
+	defer st.Close()
 
 	book := &epub.ParsedBook{
 		ID:       "book01",
@@ -113,6 +114,7 @@ func TestAdvancedStoreFeatures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
+	defer st.Close()
 
 	b1 := &epub.ParsedBook{
 		ID:            "b1",
@@ -212,11 +214,13 @@ func TestAdvancedStoreFeatures(t *testing.T) {
 		t.Fatalf("expected duplicate b2 to be removed, got %+v", dedupRep.RemovedBooks)
 	}
 
-	// Test Fast Reopen from catalog_meta.json + corpus.gob
+	// Test Fast Reopen from SQLite library.db
+	_ = st.Close()
 	st2, err := Open(tmpDir, nil)
 	if err != nil {
 		t.Fatalf("Reopen failed: %v", err)
 	}
+	defer st2.Close()
 	if bCount, _, _, _, _ := st2.Stats(); bCount != 1 {
 		t.Fatalf("expected 1 book after reopen, got %d", bCount)
 	}
