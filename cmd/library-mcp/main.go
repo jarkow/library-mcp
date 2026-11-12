@@ -238,6 +238,16 @@ func main() {
 			bCount, chCount, pCount, ckCount, vCount)
 		fmt.Printf("  Taxonomy             : %d categories, %d unique tags\n", len(cats), len(tags))
 
+	case "sync":
+		fmt.Printf("Syncing local catalog chunks to Qdrant (%s, collection: %s)...\n", cfg.QdrantURL, cfg.QdrantCollection)
+		if err := st.SyncAllToQdrant(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Qdrant sync failed: %v\n", err)
+			os.Exit(1)
+		}
+		_, _, _, ckCount, _ := st.Stats()
+		fmt.Printf("Successfully synced %d child chunks to Qdrant.\n", ckCount)
+		fmt.Printf("Inspect collection in Qdrant Dashboard: %s/dashboard#/collections/%s\n", cfg.QdrantURL, cfg.QdrantCollection)
+
 	case "config":
 		fs := flag.NewFlagSet("config", flag.ExitOnError)
 		booksDir := fs.String("books-dir", "", "Set default books directory (e.g. H:\\Books or ~/Books)")
@@ -360,6 +370,7 @@ Commands:
   ask [--book <filter>] <question>            Ask a technical question answered by local Ollama with citations
   books [--category <c>] [--tag <t>]          List indexed EPUB books with categories, tags, and web metadata
   remove <id-or-title> [--all]                Remove an indexed book by ID, title, ISBN, or filename
+  sync                                        Push all locally cataloged chunks & vectors to Qdrant
   status                                      Show Qdrant, Ollama, and library catalog status
   config [--books-dir <path>]                 View or update configuration (Windows, Linux, and WSL paths)
   serve [--port 8765]                         Start the local Web UI on http://127.0.0.1:8765
