@@ -293,25 +293,72 @@
     return card;
   }
 
+  async function refreshNotes() {
+    const out = document.getElementById("notes-output");
+    if (!out) return;
+    try {
+      const bookFilter = document.getElementById("book-filter-select").value;
+      const res = await apiFetch("/api/notes?book_filter=" + encodeURIComponent(bookFilter));
+      const notes = res.notes || [];
+      out.replaceChildren();
+      if (notes.length === 0) {
+        out.appendChild(el("div", "empty-state", "No saved notes yet. Add a note above or click 'Compile Study Dossier'."));
+        return;
+      }
+      notes.forEach(function (n) {
+        const card = el("div", "source-card");
+        const top = el("div", "source-title-row");
+        top.appendChild(el("strong", "", n.title + (n.book_title ? " — " + n.book_title : "")));
+        const del = el("button", "btn btn-small btn-danger", "Delete");
+        del.type = "button";
+        del.addEventListener("click", async function () {
+          await apiFetch("/api/notes/delete", {
+            method: "POST",
+            body: JSON.stringify({ note_id: n.id }),
+          });
+          await refreshNotes();
+        });
+        top.appendChild(del);
+        card.appendChild(top);
+        card.appendChild(el("pre", "source-snippet", n.content));
+        out.appendChild(card);
+      });
+    } catch (err) {
+      out.replaceChildren(el("div", "empty-state", "Could not load notes: " + err.message));
+    }
+  }
+
   function initEventListeners() {
     const tabAsk = document.getElementById("tab-ask");
     const tabSearch = document.getElementById("tab-search");
+    const tabNotes = document.getElementById("tab-notes");
     const viewAsk = document.getElementById("view-ask");
     const viewSearch = document.getElementById("view-search");
+    const viewNotes = document.getElementById("view-notes");
+
+    function activateTab(activeTab, activeView) {
+      [tabAsk, tabSearch, tabNotes].forEach(function (t) {
+        if (t) t.classList.toggle("active", t === activeTab);
+      });
+      [viewAsk, viewSearch, viewNotes].forEach(function (v) {
+        if (v) v.classList.toggle("hidden", v !== activeView);
+      });
+    }
 
     tabAsk.addEventListener("click", function () {
-      tabAsk.classList.add("active");
-      tabSearch.classList.remove("active");
-      viewAsk.classList.remove("hidden");
-      viewSearch.classList.add("hidden");
+      activateTab(tabAsk, viewAsk);
     });
 
     tabSearch.addEventListener("click", function () {
-      tabSearch.classList.add("active");
-      tabAsk.classList.remove("active");
-      viewSearch.classList.remove("hidden");
-      viewAsk.classList.add("hidden");
+      activateTab(tabSearch, viewSearch);
     });
+
+    if (tabNotes) {
+      tabNotes.addEventListener("click", function () {
+        activateTab(tabNotes, viewNotes);
+        refreshNotes();
+      });
+    }
 
     document.getElementById("ask-form").addEventListener("submit", async function (e) {
       e.preventDefault();
@@ -457,6 +504,78 @@
         } finally {
           enrichBtn.disabled = false;
           enrichBtn.textContent = "Enrich Metadata";
+        }
+      });
+    }
+
+    const dedupBtn = document.getElementById("btn-dedup");
+    if (dedupBtn) {
+      dedupBtn.addEventListener("click", async function () {
+        dedupBtn.disabled = true;
+        try {
+          const rep = await apiFetch("/api/books/dedup", {
+            method: "POST",
+            body: JSON.stringify({ apply: true }),
+          });
+          showToast(
+            "Deduplication complete: removed " +
+              ((rep.removed_books && rep.removed_books.length) || 0) +
+              " duplicate books (" +
+              (rep.freed_chunks || 0) +
+              " chunks freed)."
+          );
+          await refreshStatusAndBooks();
+        } catch (err) {
+          showToast("Deduplication failed: " + err.message);
+        } finally {
+          dedupBtn.disabled = false;
+        }
+      });
+    }
+
+    const noteForm = document.getElementById("note-form");
+    if (noteForm) {
+      noteForm.addEventListener("submit", async function (e) {
+        e.preventDefault();
+        const title = document.getElementById("note-title-input").value.trim();
+        const content = document.getElementById("note-content-input").value.trim() || title;
+        const bookId = document.getElementById("book-filter-select").value;
+        try {
+          await apiFetch("/api/notes", {
+            method: "POST",
+            body: JSON.stringify({ title: title, content: content, book_id: bookId }),
+          });
+          document.getElementById("note-title-input").value = "";
+          document.getElementById("note-content-input").value = "";
+          showToast("Saved note: " + title);
+          await refreshNotes();
+        } catch (err) {
+          showToast("Save note failed: " + err.message);
+        }
+      });
+    }
+
+    const dossierBtn = document.getElementById("dossier-btn");
+    if (dossierBtn) {
+      dossierBtn.addEventListener("click", async function () {
+        const topic = document.getElementById("note-title-input").value.trim();
+        if (!topic) {
+          showToast("Enter a topic in the title box first.");
+          return;
+        }
+        const out = document.getElementById("notes-output");
+        out.replaceChildren(el("div", "empty-state", "Compiling multi-book Study Dossier for '" + topic + "'..."));
+        try {
+          const res = await apiFetch("/api/dossier", {
+            method: "POST",
+            body: JSON.stringify({ topic: topic }),
+          });
+          document.getElementById("reader-title").textContent = "Study Dossier: " + topic;
+          document.getElementById("reader-subtitle").textContent = "Multi-book synthesis, code examples & chapters";
+          document.getElementById("reader-content").textContent = res.markdown || "";
+          await refreshNotes();
+        } catch (err) {
+          showToast("Dossier error: " + err.message);
         }
       });
     }

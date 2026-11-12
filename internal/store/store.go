@@ -3,9 +3,8 @@ package store
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/gob"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"math"
@@ -77,10 +76,17 @@ type Store struct {
 	qdrant  *qdrant.Client
 
 	books    map[string]BookRecord
+	notes    map[string]NoteRecord
 	chapters map[string]epub.ParsedChapter
 	parents  map[string]epub.ParentSection
 	chunks   []epub.ParsedChunk
 	vectors  [][]float32
+
+	corpusLoaded        bool
+	cachedChaptersCount int
+	cachedParentsCount  int
+	cachedChunksCount   int
+	cachedVectorsCount  int
 
 	// Local fallback BM25 structures when Qdrant container is offline
 	postings  map[string]map[int]int
@@ -98,6 +104,7 @@ func Open(dataDir string, qdrantClient *qdrant.Client) (*Store, error) {
 		dataDir:  dataDir,
 		qdrant:   qdrantClient,
 		books:    make(map[string]BookRecord),
+		notes:    make(map[string]NoteRecord),
 		chapters: make(map[string]epub.ParsedChapter),
 		parents:  make(map[string]epub.ParentSection),
 		postings: make(map[string]map[int]int),
@@ -126,57 +133,12 @@ func (s *Store) vectorsPath() string {
 func (s *Store) load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	idxPath := s.indexPath()
-	if b, err := os.ReadFile(idxPath); err == nil {
-		var pd persistedData
-		if err := json.Unmarshal(b, &pd); err != nil {
-			return err
-		}
-		if pd.Books != nil {
-			s.books = pd.Books
-		}
-		if pd.Chapters != nil {
-			s.chapters = pd.Chapters
-		}
-		if pd.Parents != nil {
-			s.parents = pd.Parents
-		}
-		s.chunks = pd.Chunks
-	}
-
-	s.vectors = make([][]float32, len(s.chunks))
-	if f, err := os.Open(s.vectorsPath()); err == nil {
-		defer f.Close()
-		var count uint32
-		if err := binary.Read(f, binary.LittleEndian, &count); err == nil {
-			limit := int(count)
-			if limit > len(s.chunks) {
-				limit = len(s.chunks)
-			}
-			for i := 0; i < limit; i++ {
-				var dim uint32
-				if err := binary.Read(f, binary.LittleEndian, &dim); err != nil {
-					break
-				}
-				if dim == 0 || dim > 16384 {
-					continue
-				}
-				vec := make([]float32, dim)
-				if err := binary.Read(f, binary.LittleEndian, vec); err != nil {
-					break
-				}
-				s.vectors[i] = vec
-			}
-		}
-	}
-
-	s.rebuildBM25Locked()
-	return nil
+	return s.loadCatalogFastLocked()
 }
 
 // Save writes the catalog and vectors atomically to disk.
 func (s *Store) Save() error {
+	s.ensureCorpusLoaded()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.saveLocked()
@@ -191,6 +153,7 @@ func (s *Store) SetBatchMode(enabled bool) {
 
 // Flush rebuilds the in-memory BM25 index and saves the catalog and vectors to disk.
 func (s *Store) Flush() error {
+	s.ensureCorpusLoaded()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.batchMode = false
@@ -199,24 +162,34 @@ func (s *Store) Flush() error {
 }
 
 func (s *Store) saveLocked() error {
-	pd := persistedData{
-		Books:    s.books,
+	if err := s.saveCatalogMetaLocked(); err != nil {
+		return err
+	}
+	if !s.corpusLoaded {
+		return nil
+	}
+
+	tmpCorpus := s.corpusPath() + ".tmp"
+	cf, err := os.OpenFile(tmpCorpus, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	bcd := binaryCorpusData{
 		Chapters: s.chapters,
 		Parents:  s.parents,
 		Chunks:   s.chunks,
 	}
-	b, err := json.Marshal(pd)
-	if err != nil {
+	if err := gob.NewEncoder(cf).Encode(&bcd); err != nil {
+		cf.Close()
 		return err
 	}
-
-	tmpIdx := s.indexPath() + ".tmp"
-	if err := os.WriteFile(tmpIdx, b, 0o600); err != nil {
+	if err := cf.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpIdx, s.indexPath()); err != nil {
+	if err := os.Rename(tmpCorpus, s.corpusPath()); err != nil {
 		return err
 	}
+	_ = os.Remove(s.indexPath())
 
 	tmpVec := s.vectorsPath() + ".tmp"
 	vf, err := os.OpenFile(tmpVec, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -265,6 +238,7 @@ func (s *Store) HasFileHash(fileHash string) bool {
 
 // UpsertBook indexes child chunks into Qdrant and saves ParentSections & Chapters in the local catalog.
 func (s *Store) UpsertBook(ctx context.Context, book *epub.ParsedBook, embeddings [][]float32) error {
+	s.ensureCorpusLoaded()
 	normEmbeddings := make([][]float32, len(book.Chunks))
 	for i := range book.Chunks {
 		if i < len(embeddings) && len(embeddings[i]) > 0 {
@@ -336,6 +310,7 @@ func (s *Store) UpsertBook(ctx context.Context, book *epub.ParsedBook, embedding
 
 // SyncAllToQdrant pushes all locally cataloged chunks and vectors into Qdrant (useful if Qdrant was started after ingestion).
 func (s *Store) SyncAllToQdrant(ctx context.Context) error {
+	s.ensureCorpusLoaded()
 	s.mu.RLock()
 	qc := s.qdrant
 	chunksCopy := append([]epub.ParsedChunk(nil), s.chunks...)
@@ -356,59 +331,16 @@ func (s *Store) DeleteBook(ctx context.Context, bookID string) error {
 
 // RemoveBook resolves a book by exact ID, ISBN, exact title/filename, or unique title substring and removes it from Qdrant and the local catalog.
 func (s *Store) RemoveBook(ctx context.Context, idOrQuery string) (BookRecord, error) {
-	q := strings.TrimSpace(idOrQuery)
-	if q == "" {
-		return BookRecord{}, errors.New("book ID or title is required")
+	matched, err := s.ResolveBook(idOrQuery)
+	if err != nil {
+		return BookRecord{}, err
 	}
+	s.ensureCorpusLoaded()
 
 	s.mu.RLock()
 	qc := s.qdrant
-	var matched BookRecord
-	found := false
-
-	if rec, ok := s.books[q]; ok {
-		matched = rec
-		found = true
-	} else {
-		lowerQ := strings.ToLower(q)
-		for _, b := range s.books {
-			if strings.EqualFold(b.ID, q) ||
-				strings.EqualFold(b.Title, q) ||
-				strings.EqualFold(b.FileName, q) ||
-				(b.RelPath != "" && strings.EqualFold(b.RelPath, q)) ||
-				(b.ISBN != "" && strings.EqualFold(b.ISBN, q)) {
-				matched = b
-				found = true
-				break
-			}
-		}
-		if !found {
-			var candidates []BookRecord
-			for _, b := range s.books {
-				if strings.Contains(strings.ToLower(b.Title), lowerQ) ||
-					strings.Contains(strings.ToLower(b.FileName), lowerQ) ||
-					strings.Contains(strings.ToLower(b.RelPath), lowerQ) {
-					candidates = append(candidates, b)
-				}
-			}
-			if len(candidates) == 1 {
-				matched = candidates[0]
-				found = true
-			} else if len(candidates) > 1 {
-				s.mu.RUnlock()
-				var names []string
-				for _, c := range candidates {
-					names = append(names, fmt.Sprintf("%s (%s)", c.Title, c.ID))
-				}
-				return BookRecord{}, fmt.Errorf("ambiguous book query %q matched %d books: %s", q, len(candidates), strings.Join(names, ", "))
-			}
-		}
-	}
 	s.mu.RUnlock()
 
-	if !found {
-		return BookRecord{}, fmt.Errorf("book %q not found", q)
-	}
 	if qc != nil {
 		_ = qc.DeleteByBookID(ctx, matched.ID)
 	}
@@ -590,6 +522,7 @@ func (s *Store) UpdateBookMetadata(bookID string, meta metadata.BookMetadata) (B
 
 // GetBook returns a book record and its ordered chapters (without full content for fast listing).
 func (s *Store) GetBook(bookID string) (BookRecord, []epub.ParsedChapter, bool) {
+	s.ensureCorpusLoaded()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -613,6 +546,7 @@ func (s *Store) GetBook(bookID string) (BookRecord, []epub.ParsedChapter, bool) 
 
 // GetChapter returns the full chapter including content by chapter ID.
 func (s *Store) GetChapter(chapterID string) (epub.ParsedChapter, bool) {
+	s.ensureCorpusLoaded()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -622,6 +556,7 @@ func (s *Store) GetChapter(chapterID string) (epub.ParsedChapter, bool) {
 
 // GetParentSection returns the full ParentSection by parent ID.
 func (s *Store) GetParentSection(parentID string) (epub.ParentSection, bool) {
+	s.ensureCorpusLoaded()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -634,6 +569,16 @@ func (s *Store) Stats() (booksCount, chaptersCount, parentsCount, chunksCount, v
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if !s.corpusLoaded {
+		chCount, pCount, ckCount := 0, 0, 0
+		for _, b := range s.books {
+			chCount += b.ChapterCount
+			pCount += b.ParentCount
+			ckCount += b.ChunkCount
+		}
+		return len(s.books), chCount, pCount, ckCount, s.cachedVectorsCount
+	}
+
 	vCount := 0
 	for _, v := range s.vectors {
 		if len(v) > 0 {
@@ -645,42 +590,12 @@ func (s *Store) Stats() (booksCount, chaptersCount, parentsCount, chunksCount, v
 
 // Search executes Qdrant Hybrid Search (or local fallback) and promotes child chunk hits to deduplicated ParentSections.
 func (s *Store) Search(ctx context.Context, query string, queryVec []float32, mode, bookFilter string, topK int) []SearchResult {
-	if topK <= 0 {
-		topK = 6
-	}
-	if mode == "" {
-		mode = "hybrid"
-	}
-
-	var normQueryVec []float32
-	if len(queryVec) > 0 {
-		normQueryVec = normalizeVector(queryVec)
-	}
-
-	s.mu.RLock()
-	qc := s.qdrant
-	s.mu.RUnlock()
-
-	// 1. Try Qdrant Universal Query API (Dense + Sparse RRF) first
-	if qc != nil {
-		qPoints, err := qc.QueryHybrid(ctx, query, normQueryVec, mode, bookFilter, topK*3)
-		if err == nil && len(qPoints) > 0 {
-			childResults := make([]SearchResult, 0, len(qPoints))
-			for _, pt := range qPoints {
-				childResults = append(childResults, SearchResult{
-					Chunk:        pt.Payload,
-					ParentID:     pt.Payload.ParentID,
-					Score:        pt.Score,
-					MatchSources: []string{"qdrant:" + mode},
-				})
-			}
-			return s.promoteToParents(childResults, topK)
-		}
-	}
-
-	// 2. Fallback to local in-memory hybrid search if Qdrant is offline or empty
-	childResults := s.searchLocalFallback(query, normQueryVec, mode, bookFilter, topK*3)
-	return s.promoteToParents(childResults, topK)
+	return s.SearchWithOptions(ctx, queryVec, SearchOptions{
+		Query:      query,
+		Mode:       mode,
+		BookFilter: bookFilter,
+		TopK:       topK,
+	})
 }
 
 // promoteToParents maps matched child chunks to their ParentSections, deduplicating by ParentID and boosting multi-hit parents.

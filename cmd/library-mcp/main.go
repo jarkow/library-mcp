@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"library-mcp/internal/config"
 	"library-mcp/internal/mcp"
@@ -122,24 +123,31 @@ func main() {
 		bookFlag := fs.String("book", "", "Filter by book title, author, book ID, category, or tag")
 		catFlag := fs.String("category", "", "Filter by category")
 		tagFlag := fs.String("tag", "", "Filter by tag")
+		authorFlag := fs.String("author", "", "Filter by author substring")
+		yearMinFlag := fs.Int("year-min", 0, "Filter by minimum published year")
+		maxPerBookFlag := fs.Int("max-per-book", 0, "Maximum sections per book (0 = auto diversity)")
+		codeOnlyFlag := fs.Bool("code-only", false, "Only return sections containing code or CLI examples")
 		topKFlag := fs.Int("top-k", cfg.TopK, "Number of Parent Sections to retrieve")
 		_ = fs.Parse(args)
 
-		filter := *bookFlag
-		if filter == "" && *catFlag != "" {
-			filter = *catFlag
-		}
-		if filter == "" && *tagFlag != "" {
-			filter = *tagFlag
-		}
-
 		query := strings.TrimSpace(strings.Join(fs.Args(), " "))
 		if query == "" {
-			fmt.Fprintln(os.Stderr, "Usage: library-mcp search [--mode hybrid|semantic|keyword] [--book <filter>] [--category <cat>] [--tag <tag>] <query>")
+			fmt.Fprintln(os.Stderr, "Usage: library-mcp search [--mode hybrid|semantic|keyword] [--book <filter>] [--category <cat>] [--tag <tag>] [--author <name>] [--year-min <yr>] [--max-per-book <n>] [--code-only] <query>")
 			os.Exit(1)
 		}
 
-		results := engine.Search(ctx, query, *modeFlag, filter, *topKFlag)
+		results := engine.SearchWithOptions(ctx, store.SearchOptions{
+			Query:      query,
+			Mode:       *modeFlag,
+			BookFilter: *bookFlag,
+			Category:   *catFlag,
+			Tag:        *tagFlag,
+			Author:     *authorFlag,
+			YearMin:    *yearMinFlag,
+			MaxPerBook: *maxPerBookFlag,
+			CodeOnly:   *codeOnlyFlag,
+			TopK:       *topKFlag,
+		})
 		if len(results) == 0 {
 			fmt.Println("No matching sections found.")
 			return
@@ -156,6 +164,221 @@ func main() {
 			fmt.Println(text)
 			fmt.Println()
 		}
+
+	case "toc":
+		target := strings.TrimSpace(strings.Join(args, " "))
+		if target == "" {
+			fmt.Fprintln(os.Stderr, "Usage: library-mcp toc <book-id | title | isbn>")
+			os.Exit(1)
+		}
+		toc, err := st.GetBookTOC(target)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Table of Contents: %s by %s [%s]\n", toc.Book.Title, toc.Book.Author, toc.Book.ID)
+		fmt.Printf("Category: %s | Chapters: %d | Parent Sections: %d\n\n", toc.Book.Category, toc.Book.ChapterCount, toc.Book.ParentCount)
+		for _, ch := range toc.Chapters {
+			fmt.Printf("  [%02d] %s (chapter_id: %s, %d chars)\n", ch.ChapterIndex, ch.Title, ch.ChapterID, ch.CharLength)
+			for _, sec := range ch.Sections {
+				if sec.Title != "" && !strings.EqualFold(sec.Title, ch.Title) {
+					fmt.Printf("       - %s (parent_id: %s, %d chars)\n", sec.Title, sec.ParentID, sec.CharLength)
+				}
+			}
+		}
+
+	case "chapters":
+		fs := flag.NewFlagSet("chapters", flag.ExitOnError)
+		bookFlag := fs.String("book", "", "Filter by book ID or title")
+		catFlag := fs.String("category", "", "Filter by category")
+		tagFlag := fs.String("tag", "", "Filter by tag")
+		topKFlag := fs.Int("top-k", 15, "Maximum chapters to return")
+		_ = fs.Parse(args)
+
+		query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		if query == "" {
+			fmt.Fprintln(os.Stderr, "Usage: library-mcp chapters [--book <filter>] [--category <cat>] [--tag <tag>] <query>")
+			os.Exit(1)
+		}
+		hits := st.SearchChapters(query, *bookFlag, *catFlag, *tagFlag, *topKFlag)
+		if len(hits) == 0 {
+			fmt.Println("No matching chapters found.")
+			return
+		}
+		for i, h := range hits {
+			fmt.Printf("[%d] %s (%s) — %s > %s\n", i+1, h.BookTitle, h.Author, h.ChapterTitle, h.SectionTitle)
+			fmt.Printf("    chapter_id: %s | parent_id: %s | Category: %s | Score: %.1f\n", h.ChapterID, h.ParentID, h.Category, h.Score)
+		}
+
+	case "compare":
+		fs := flag.NewFlagSet("compare", flag.ExitOnError)
+		catFlag := fs.String("category", "", "Filter by category")
+		tagFlag := fs.String("tag", "", "Filter by tag")
+		maxBooksFlag := fs.Int("max-books", 5, "Number of distinct books to compare")
+		_ = fs.Parse(args)
+
+		topic := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		if topic == "" {
+			fmt.Fprintln(os.Stderr, "Usage: library-mcp compare [--category <cat>] [--tag <tag>] [--max-books 5] <topic>")
+			os.Exit(1)
+		}
+		_, md := engine.CompareBooksOnTopic(ctx, topic, *catFlag, *tagFlag, *maxBooksFlag)
+		fmt.Println(md)
+
+	case "code":
+		fs := flag.NewFlagSet("code", flag.ExitOnError)
+		langFlag := fs.String("lang", "", "Filter by programming language or tool")
+		bookFlag := fs.String("book", "", "Filter by book")
+		catFlag := fs.String("category", "", "Filter by category")
+		topKFlag := fs.Int("top-k", 5, "Number of code sections to retrieve")
+		_ = fs.Parse(args)
+
+		query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		if query == "" {
+			fmt.Fprintln(os.Stderr, "Usage: library-mcp code [--lang <lang>] [--book <book>] [--category <cat>] <query>")
+			os.Exit(1)
+		}
+		results := engine.ExtractCodeExamples(ctx, query, *langFlag, *bookFlag, *catFlag, *topKFlag)
+		if len(results) == 0 {
+			fmt.Println("No matching code sections found.")
+			return
+		}
+		for i, res := range results {
+			ck := res.Chunk
+			fmt.Printf("=== [Code Example %d] %s — %s > %s (Score: %.4f) ===\n", i+1, ck.BookTitle, ck.ChapterTitle, ck.SectionTitle, res.Score)
+			fmt.Println(res.ParentText)
+			fmt.Println()
+		}
+
+	case "dedup":
+		fs := flag.NewFlagSet("dedup", flag.ExitOnError)
+		applyFlag := fs.Bool("apply", false, "Remove duplicate editions and keep the highest-quality copy of each book")
+		_ = fs.Parse(args)
+
+		rep, err := st.DeduplicateBooks(ctx, *applyFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Deduplication failed: %v\n", err)
+			os.Exit(1)
+		}
+		if len(rep.Groups) == 0 {
+			fmt.Println("No duplicate books found in the catalog.")
+			return
+		}
+		if *applyFlag {
+			fmt.Printf("Deduplication Complete: Removed %d duplicate books (%d chunks freed):\n", len(rep.RemovedBooks), rep.FreedChunks)
+		} else {
+			fmt.Printf("Duplicate Books Analysis (Dry Run): %d duplicate groups found (%d chunks can be freed).\nRun 'library-mcp dedup --apply' to remove duplicates.\n\n", len(rep.Groups), rep.FreedChunks)
+		}
+		for i, g := range rep.Groups {
+			fmt.Printf("  [%d] %s — %s (%s)\n", i+1, g.Keep.Title, g.Keep.Author, g.Reason)
+			fmt.Printf("      KEEP : [%s] %s (%d chunks)\n", g.Keep.ID, g.Keep.FileName, g.Keep.ChunkCount)
+			for _, d := range g.Duplicates {
+				fmt.Printf("      DUP  : [%s] %s (%d chunks)\n", d.ID, d.FileName, d.ChunkCount)
+			}
+		}
+
+	case "notes":
+		subAction := "list"
+		subArgs := args
+		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+			subAction = args[0]
+			subArgs = args[1:]
+		}
+		switch subAction {
+		case "add", "save":
+			fs := flag.NewFlagSet("notes add", flag.ExitOnError)
+			titleFlag := fs.String("title", "", "Note title")
+			bookFlag := fs.String("book", "", "Book ID or title")
+			chapFlag := fs.String("chapter", "", "Chapter ID")
+			parentFlag := fs.String("parent", "", "Parent section ID")
+			tagFlag := fs.String("tag", "", "Comma-separated tags")
+			_ = fs.Parse(subArgs)
+			content := strings.TrimSpace(strings.Join(fs.Args(), " "))
+			if content == "" {
+				fmt.Fprintln(os.Stderr, "Usage: library-mcp notes add [--title <t>] [--book <b>] [--chapter <c>] [--tag <t1,t2>] <note content>")
+				os.Exit(1)
+			}
+			var tags []string
+			for _, t := range strings.Split(*tagFlag, ",") {
+				if strings.TrimSpace(t) != "" {
+					tags = append(tags, strings.TrimSpace(t))
+				}
+			}
+			saved, err := st.SaveNote(store.NoteRecord{
+				Title:     *titleFlag,
+				Content:   content,
+				BookID:    *bookFlag,
+				ChapterID: *chapFlag,
+				ParentID:  *parentFlag,
+				Tags:      tags,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error saving note: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Saved note [%s] %s (Book: %s)\n", saved.ID, saved.Title, saved.BookTitle)
+
+		case "remove", "delete", "rm":
+			if len(subArgs) == 0 {
+				fmt.Fprintln(os.Stderr, "Usage: library-mcp notes remove <note-id>")
+				os.Exit(1)
+			}
+			deleted, err := st.DeleteNote(subArgs[0])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error deleting note: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Deleted note [%s] %s\n", deleted.ID, deleted.Title)
+
+		default:
+			fs := flag.NewFlagSet("notes list", flag.ExitOnError)
+			bookFlag := fs.String("book", "", "Filter by book")
+			tagFlag := fs.String("tag", "", "Filter by tag")
+			_ = fs.Parse(subArgs)
+			query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+			notes := st.ListNotes(query, *bookFlag, *tagFlag)
+			if len(notes) == 0 {
+				fmt.Println("No saved notes found.")
+				return
+			}
+			fmt.Printf("Saved Notes (%d):\n", len(notes))
+			for _, n := range notes {
+				fmt.Printf("  - [%s] %s (Book: %s | Updated: %s)\n    %s\n", n.ID, n.Title, n.BookTitle, n.UpdatedAt, n.Content)
+			}
+		}
+
+	case "dossier":
+		fs := flag.NewFlagSet("dossier", flag.ExitOnError)
+		catFlag := fs.String("category", "", "Filter by category")
+		tagFlag := fs.String("tag", "", "Filter by tag")
+		outFlag := fs.String("out", "", "Output Markdown file path")
+		topKFlag := fs.Int("top-k", 6, "Number of core sections to include")
+		_ = fs.Parse(args)
+
+		topic := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		if topic == "" {
+			fmt.Fprintln(os.Stderr, "Usage: library-mcp dossier [--category <cat>] [--tag <tag>] [--out <file.md>] <topic>")
+			os.Exit(1)
+		}
+		md, savedPath, err := engine.ExportTopicDossier(ctx, topic, *catFlag, *tagFlag, *outFlag, *topKFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Dossier export failed: %v\n", err)
+			os.Exit(1)
+		}
+		if savedPath != "" {
+			fmt.Printf("Saved dossier to %s\n\n", savedPath)
+		}
+		fmt.Println(md)
+
+	case "watch":
+		fs := flag.NewFlagSet("watch", flag.ExitOnError)
+		intervalSec := fs.Int("interval", 10, "Poll interval in seconds")
+		_ = fs.Parse(args)
+		fmt.Printf("Watching %s for new or modified books (poll every %ds)...\n", cfg.ResolvedBooksDir(), *intervalSec)
+		engine.StartWatcher(ctx, time.Duration(*intervalSec)*time.Second, func(ev rag.WatcherEvent) {
+			fmt.Printf("[%s] %s -> %s (%d chunks)\n", ev.Timestamp, ev.File, ev.Status, ev.Chunks)
+		})
+		select {}
 
 	case "ask":
 		fs := flag.NewFlagSet("ask", flag.ExitOnError)
@@ -237,6 +460,7 @@ func main() {
 		fmt.Printf("  Catalog Totals       : %d books, %d chapters, %d parent sections, %d child chunks (%d vectors)\n",
 			bCount, chCount, pCount, ckCount, vCount)
 		fmt.Printf("  Taxonomy             : %d categories, %d unique tags\n", len(cats), len(tags))
+		fmt.Printf("  Saved Notes          : %d notes | Duplicate Groups: %d\n", len(st.ListNotes("", "", "")), len(st.FindDuplicates()))
 
 	case "sync":
 		fmt.Printf("Syncing local catalog chunks to Qdrant (%s, collection: %s)...\n", cfg.QdrantURL, cfg.QdrantCollection)
@@ -364,15 +588,23 @@ Usage:
   library-mcp <command> [options]
 
 Commands:
-  ingest [--dir <path>] [--force]             Scan, fetch web metadata, tag/categorize, and index EPUB books
+  ingest [--dir <path>] [--force]             Scan, fetch web metadata, tag/categorize, and index books
   enrich [--book <id>] [--force]              Fetch/refresh web metadata (Google Books + Open Library) & tags/categories
-  search [--category <c>] [--tag <t>] <query> Hybrid RRF search promoting Parent Sections
+  search [--category <c>] [--tag <t>] <query> Hybrid RRF search with MMR diversity promoting Parent Sections
+  toc <book-id-or-title>                      Inspect a book's full hierarchical Table of Contents
+  chapters [--category <c>] <query>           Search across all chapter titles and section headings
+  compare [--category <c>] <topic>            Compare perspectives on a topic across distinct books/authors
+  code [--lang <lang>] <query>                Extract code examples, CLI commands, and technical patterns
+  dedup [--apply]                             Detect and optionally remove duplicate book editions
+  notes [list|add|remove] [...]               Save and search personal/agent notes, bookmarks, and takeaways
+  dossier [--out <file.md>] <topic>           Compile a comprehensive Markdown Study Guide / Technical Dossier
+  watch [--interval 10]                       Watch books directory for new/modified files and auto-index
   ask [--book <filter>] <question>            Ask a technical question answered by local Ollama with citations
-  books [--category <c>] [--tag <t>]          List indexed EPUB books with categories, tags, and web metadata
+  books [--category <c>] [--tag <t>]          List indexed books with categories, tags, and web metadata
   remove <id-or-title> [--all]                Remove an indexed book by ID, title, ISBN, or filename
   sync                                        Push all locally cataloged chunks & vectors to Qdrant
   status                                      Show Qdrant, Ollama, and library catalog status
   config [--books-dir <path>]                 View or update configuration (Windows, Linux, and WSL paths)
-  serve [--port 8765]                         Start the local Web UI on http://127.0.0.1:8765
+  serve [--port 8765]                         Start the local Web UI on http://127.0.0.1:8765 (with live watcher)
   mcp                                         Start the Model Context Protocol (MCP) server over stdio`)
 }

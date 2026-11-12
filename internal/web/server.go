@@ -21,6 +21,7 @@ import (
 	"library-mcp/internal/config"
 	"library-mcp/internal/epub"
 	"library-mcp/internal/rag"
+	"library-mcp/internal/store"
 )
 
 //go:embed static/*
@@ -74,23 +75,32 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/books", s.handleBooks)
 	mux.HandleFunc("/api/book", s.handleBookDetail)
+	mux.HandleFunc("/api/toc", s.handleBookTOC)
 	mux.HandleFunc("/api/chapter", s.handleChapter)
+	mux.HandleFunc("/api/chapters/search", s.handleSearchChapters)
 	mux.HandleFunc("/api/parent", s.handleParentSection)
 	mux.HandleFunc("/api/search", s.handleSearch)
+	mux.HandleFunc("/api/compare", s.handleCompare)
+	mux.HandleFunc("/api/code", s.handleCodeExamples)
+	mux.HandleFunc("/api/dossier", s.handleDossier)
 	mux.HandleFunc("/api/ask", s.handleAsk)
 	mux.HandleFunc("/api/ingest", s.handleIngest)
 	mux.HandleFunc("/api/enrich", s.handleEnrich)
 	mux.HandleFunc("/api/upload", s.handleUpload)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/books/delete", s.handleDeleteBook)
+	mux.HandleFunc("/api/books/dedup", s.handleDedupBooks)
+	mux.HandleFunc("/api/notes", s.handleNotes)
+	mux.HandleFunc("/api/notes/delete", s.handleDeleteNote)
 	mux.HandleFunc("/api/qdrant/sync", s.handleQdrantSync)
 	mux.HandleFunc("/api/session/logout", s.handleLogout)
 
 	return s.securityMiddleware(mux)
 }
 
-// ListenAndServe starts the HTTP server strictly bound to 127.0.0.1:<port>.
+// ListenAndServe starts the HTTP server strictly bound to 127.0.0.1:<port> and starts the live folder watcher.
 func (s *Server) ListenAndServe() error {
+	s.engine.StartWatcher(context.Background(), 10*time.Second, nil)
 	cfg := s.engine.GetConfig()
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 	srv := &http.Server{
@@ -249,11 +259,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"parents_count":      parentsCount,
 		"chunks_count":       chunksCount,
 		"vectors_count":      vectorsCount,
+		"notes_count":        len(s.engine.Store().ListNotes("", "", "")),
+		"duplicates_count":   len(s.engine.Store().FindDuplicates()),
+		"watcher_events":     s.engine.RecentWatcherEvents(),
 		"qdrant_online":      qdrantOK,
 		"qdrant_dashboard":   strings.TrimRight(cfg.QdrantURL, "/") + "/dashboard",
 		"ollama_online":      ollamaErr == nil,
 		"ollama_models":      modelNames,
-		"retrieval_strategy": "Parent-Child Hierarchical + Qdrant Hybrid RRF (Dense + Sparse)",
+		"retrieval_strategy": "Parent-Child Hierarchical + Qdrant Hybrid RRF + MMR Cross-Book Diversity",
 	})
 }
 
@@ -355,12 +368,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "POST required.")
 		return
 	}
-	var req struct {
-		Query      string `json:"query"`
-		Mode       string `json:"mode"`
-		BookFilter string `json:"book_filter"`
-		TopK       int    `json:"top_k"`
-	}
+	var req store.SearchOptions
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "Invalid JSON request body.")
 		return
@@ -373,10 +381,172 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		req.Mode = "hybrid"
 	}
 
-	results := s.engine.Search(r.Context(), req.Query, req.Mode, req.BookFilter, req.TopK)
+	results := s.engine.SearchWithOptions(r.Context(), req)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"results": results,
 	})
+}
+
+func (s *Server) handleBookTOC(w http.ResponseWriter, r *http.Request) {
+	bookID := strings.TrimSpace(r.URL.Query().Get("id"))
+	if bookID == "" {
+		writeJSONError(w, http.StatusBadRequest, "Missing book id parameter.")
+		return
+	}
+	toc, err := s.engine.Store().GetBookTOC(bookID)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, toc)
+}
+
+func (s *Server) handleSearchChapters(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "POST required.")
+		return
+	}
+	var req struct {
+		Query      string `json:"query"`
+		BookFilter string `json:"book_filter"`
+		Category   string `json:"category"`
+		Tag        string `json:"tag"`
+		TopK       int    `json:"top_k"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&req); err != nil || strings.TrimSpace(req.Query) == "" {
+		writeJSONError(w, http.StatusBadRequest, "Missing query.")
+		return
+	}
+	hits := s.engine.Store().SearchChapters(req.Query, req.BookFilter, req.Category, req.Tag, req.TopK)
+	writeJSON(w, http.StatusOK, map[string]any{"chapters": hits})
+}
+
+func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "POST required.")
+		return
+	}
+	var req struct {
+		Topic    string `json:"topic"`
+		Category string `json:"category"`
+		Tag      string `json:"tag"`
+		MaxBooks int    `json:"max_books"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&req); err != nil || strings.TrimSpace(req.Topic) == "" {
+		writeJSONError(w, http.StatusBadRequest, "Missing topic.")
+		return
+	}
+	results, markdown := s.engine.CompareBooksOnTopic(r.Context(), req.Topic, req.Category, req.Tag, req.MaxBooks)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"results":  results,
+		"markdown": markdown,
+	})
+}
+
+func (s *Server) handleCodeExamples(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "POST required.")
+		return
+	}
+	var req struct {
+		Query      string `json:"query"`
+		Language   string `json:"language"`
+		BookFilter string `json:"book_filter"`
+		Category   string `json:"category"`
+		TopK       int    `json:"top_k"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&req); err != nil || strings.TrimSpace(req.Query) == "" {
+		writeJSONError(w, http.StatusBadRequest, "Missing query.")
+		return
+	}
+	results := s.engine.ExtractCodeExamples(r.Context(), req.Query, req.Language, req.BookFilter, req.Category, req.TopK)
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+func (s *Server) handleDossier(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "POST required.")
+		return
+	}
+	var req struct {
+		Topic    string `json:"topic"`
+		Category string `json:"category"`
+		Tag      string `json:"tag"`
+		TopK     int    `json:"top_k"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 32*1024)).Decode(&req); err != nil || strings.TrimSpace(req.Topic) == "" {
+		writeJSONError(w, http.StatusBadRequest, "Missing topic.")
+		return
+	}
+	md, _, err := s.engine.ExportTopicDossier(r.Context(), req.Topic, req.Category, req.Tag, "", req.TopK)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"markdown": md})
+}
+
+func (s *Server) handleDedupBooks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "POST required.")
+		return
+	}
+	var req struct {
+		Apply bool `json:"apply"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 8*1024)).Decode(&req)
+	rep, err := s.engine.Store().DeduplicateBooks(r.Context(), req.Apply)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
+func (s *Server) handleNotes(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		q := r.URL.Query().Get("query")
+		bf := r.URL.Query().Get("book_filter")
+		tag := r.URL.Query().Get("tag")
+		notes := s.engine.Store().ListNotes(q, bf, tag)
+		writeJSON(w, http.StatusOK, map[string]any{"notes": notes})
+		return
+	}
+	if r.Method == http.MethodPost {
+		var note store.NoteRecord
+		if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&note); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "Invalid note JSON.")
+			return
+		}
+		saved, err := s.engine.Store().SaveNote(note)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"note": saved})
+		return
+	}
+	writeJSONError(w, http.StatusMethodNotAllowed, "GET or POST required.")
+}
+
+func (s *Server) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "POST required.")
+		return
+	}
+	var req struct {
+		NoteID string `json:"note_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8*1024)).Decode(&req); err != nil || strings.TrimSpace(req.NoteID) == "" {
+		writeJSONError(w, http.StatusBadRequest, "Missing note_id.")
+		return
+	}
+	deleted, err := s.engine.Store().DeleteNote(req.NoteID)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "note": deleted})
 }
 
 func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {

@@ -20,6 +20,7 @@
       <span id="stats-pill" class="pill pill-info">0 Books | 0 Parents | 0 Chunks</span>
       <button id="btn-ingest" class="btn btn-primary" type="button">Scan Books Dir</button>
       <button id="btn-enrich" class="btn btn-secondary" type="button">Enrich Metadata</button>
+      <button id="btn-dedup" class="btn btn-secondary" type="button">Deduplicate</button>
       <button id="btn-settings" class="btn btn-secondary" type="button">Settings</button>
     </div>
   </header>
@@ -50,6 +51,7 @@
       <nav class="tabs">
         <button id="tab-ask" class="tab active" type="button">Ask AI (Hierarchical RAG)</button>
         <button id="tab-search" class="tab" type="button">Qdrant Hybrid Search</button>
+        <button id="tab-notes" class="tab" type="button">Notes &amp; Study Dossiers</button>
       </nav>
 
       <!-- Ask AI View -->
@@ -78,6 +80,17 @@
           <button id="search-submit" class="btn btn-primary" type="submit">Search</button>
         </form>
         <div id="search-output" class="output-area"></div>
+      </div>
+
+      <!-- Notes & Study Dossiers View -->
+      <div id="view-notes" class="tab-view hidden">
+        <form id="note-form" class="query-bar">
+          <input id="note-title-input" type="text" class="input-control" placeholder="Note title or topic for Study Dossier..." required>
+          <input id="note-content-input" type="text" class="input-control" placeholder="Note content / architectural takeaway...">
+          <button id="note-submit" class="btn btn-primary" type="submit">Save Note</button>
+          <button id="dossier-btn" class="btn btn-secondary" type="button">Compile Study Dossier</button>
+        </form>
+        <div id="notes-output" class="output-area"></div>
       </div>
     </section>
 

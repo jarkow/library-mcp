@@ -25,9 +25,9 @@ Standard naive RAG pipelines split books into fixed 500-character slices. For te
    - Extracts embedded OPF/EXTH/PDF metadata and ISBNs, then queries **Google Books** and **Open Library** to populate canonical **Title, Subtitle, Author, Publisher, Published Year, ISBN-13, Page Count, Description, Cover URL, and Web URL**.
    - Classifies every book into a primary **Category** (`AI & Machine Learning`, `Security & Cryptography`, `Software Architecture & Design`, `Software Engineering & DevOps`, `Data Engineering & Databases`, `Systems & Networking`) and assigns up to 8 normalized technical **Tags** (`rag`, `llm`, `domain-driven-design`, `xss`, `ci-cd`, etc.) using book metadata, chapter titles, and parent folder names.
 5. **Three Interfaces in One Binary**:
-   - **MCP Server (`library-mcp mcp`)**: Exposes `search_books`, `list_books`, `get_chapter`, `enrich_books`, and `remove_book` over `stdio` JSON-RPC 2.0.
-   - **Command-Line Interface (`library-mcp <cmd>`)**: Fast CLI for ingesting, enriching, searching, asking questions, removing books, and syncing to Qdrant.
-   - **Local Web UI (`library-mcp serve`)**: Dark-mode three-pane research interface (`http://127.0.0.1:8765`) with book catalog, category/tag badges, hybrid search, RAG Q&A, and a full chapter reader.
+   - **MCP Server (`library-mcp mcp`)**: Exposes **12 MCP Tools** (`search_books`, `list_books`, `get_book_toc`, `search_chapters`, `get_chapter`, `compare_books_on_topic`, `extract_code_examples`, `deduplicate_books`, `save_note`, `list_notes`, `delete_note`, `export_dossier`, `enrich_books`, `remove_book`), **MCP Resources** (`resources/list`, `resources/read`), and **MCP Prompts** (`prompts/list`, `prompts/get`) over `stdio` JSON-RPC 2.0.
+   - **Command-Line Interface (`library-mcp <cmd>`)**: Fast CLI (<10ms cold start via `catalog_meta.json` + binary `corpus.gob`) for ingesting, enriching, searching, comparing books, extracting code examples, deduplicating editions, managing notes, exporting study dossiers, watching folders, and syncing to Qdrant.
+   - **Local Web UI (`library-mcp serve`)**: Dark-mode three-pane research interface (`http://127.0.0.1:8765`) with live background folder watcher, book catalog, hybrid search, RAG Q&A, study notes & dossier generator, and a full chapter reader.
 
 ---
 
@@ -76,7 +76,8 @@ All runtime data is stored inside the `./data` folder of the repository:
 | Path | Description |
 | :--- | :--- |
 | `data/qdrant_storage/` | **Qdrant Vector Database storage volume** mounted into the `library-mcp-qdrant` container (`/qdrant/storage`). Holds Qdrant's collections, HNSW dense vector indexes, sparse inverted indexes, and payloads. |
-| `data/library_index.json` | Local JSON catalog containing all `Books` (metadata, categories, tags), `Chapters` (full chapter text), `Parents` (~3,200-char parent sections), and `Chunks` (~650-char child chunks). |
+| `data/catalog_meta.json` | Fast lightweight catalog index containing all `Books` (metadata, categories, tags), `Notes` (bookmarks & takeaways), and corpus summary counts for instant (<10ms) CLI & MCP startup. |
+| `data/corpus.gob` | High-speed binary Gob store containing all `Chapters` (full chapter text), `Parents` (~3,200-char parent sections), and `Chunks` (~650-char child chunks), loaded lazily on demand. |
 | `data/vectors.bin` | Local binary float32 embedding cache. Allows instant offline vector search and lets you push all indexed chunks to Qdrant anytime via `library-mcp sync`. |
 | `data/uploads/` | Books uploaded directly through the Web UI. |
 
@@ -162,8 +163,35 @@ go build -o library-mcp.exe .\cmd\library-mcp
 ./library-mcp remove "Web Application Security"
 ./library-mcp remove cccc4eb9935d74e0
 
-# Search books from the terminal (hybrid, semantic, or keyword)
-./library-mcp search --category "Architecture" "bounded context ubiquitous language"
+# Search books from the terminal (with category, tag, author, year, per-book diversity, or code-only filters)
+./library-mcp search --category "Architecture" --max-per-book 2 "bounded context ubiquitous language"
+./library-mcp search --code-only --tag "golang" "concurrency worker pool"
+
+# Inspect a book's full hierarchical Table of Contents
+./library-mcp toc "Designing Data-Intensive Applications"
+
+# Search across all chapter and section headings
+./library-mcp chapters --category "Security" "authentication"
+
+# Compare perspectives on a topic across distinct books & authors (1 per book + MMR diversity)
+./library-mcp compare --max-books 5 "microservices vs modular monolith"
+
+# Extract code examples, CLI commands, and technical patterns
+./library-mcp code --lang "golang" "context cancellation"
+
+# Detect and optionally remove duplicate book editions
+./library-mcp dedup
+./library-mcp dedup --apply
+
+# Save and search personal/agent notes & bookmarks
+./library-mcp notes add --title "DDD Aggregates" --book "Domain-Driven Design" "Reference other aggregates only by identity."
+./library-mcp notes list
+
+# Compile a comprehensive Markdown Study Guide / Technical Dossier
+./library-mcp dossier --out dossier_zero_trust.md "Zero Trust Architecture"
+
+# Watch configured books folder for new/modified files and auto-index
+./library-mcp watch
 
 # Ask a question answered by local Ollama with citations
 ./library-mcp ask "How do LSM-trees compare to B-trees for write throughput?"
@@ -214,14 +242,28 @@ The binary includes a built-in **Model Context Protocol (MCP)** server (`library
 }
 ```
 
-### Tools Exposed via MCP
-1. **`search_books`** (`query`, optional `book_filter`, optional `category`, optional `tag`, optional `top_k`):
-   Runs Qdrant Hybrid Search (Dense `bge-m3` + Sparse BM25 RRF) and returns **promoted Parent Sections** (~3,200 chars each, with complete code blocks and `[Book > Chapter > Section]` metadata).
-2. **`list_books`** (optional `category`, optional `tag`):
+### Tools, Resources & Prompts Exposed via MCP
+1. **`search_books`** (`query`, optional `book_filter`, `category`, `tag`, `author`, `year_min`, `max_per_book`, `code_only`, `top_k`):
+   Runs Qdrant Hybrid Search (Dense `bge-m3` + Sparse BM25 RRF) with **MMR Cross-Book Diversity** and returns **promoted Parent Sections** (~3,200 chars each, with complete code blocks and `[Book > Chapter > Section]` metadata).
+2. **`list_books`** (optional `category`, `tag`, `author`, `year_min`):
    Lists all books currently indexed in your library along with their **Category**, **Tags**, **Publisher**, **Year**, **ISBN**, and **Metadata Source**.
-3. **`get_chapter`** (`chapter_id`):
+3. **`get_book_toc`** (`book_id`):
+   Returns a book's full hierarchical Table of Contents (all chapters and nested parent section headings with their IDs and sizes).
+4. **`search_chapters`** (`query`, optional `book_filter`, `category`, `tag`, `top_k`):
+   Searches specifically across all chapter titles and section headings before pulling full text.
+5. **`get_chapter`** (`chapter_id`):
    Fetches the full text of a chapter when the AI agent needs to read beyond a single section.
-4. **`enrich_books`** (optional `book_id`, optional `force`):
-   Fetches/refreshes live web metadata from Google Books & Open Library and updates categories and tags.
-5. **`remove_book`** (`book_id`):
-   Removes a book (and all its chapters, parent sections, and chunks) by book ID, title, ISBN, or filename.
+6. **`compare_books_on_topic`** (`topic`, optional `category`, `tag`, `max_books`):
+   Retrieves the top Parent Section from distinct books (`MaxPerBook: 1` with MMR diversity) to synthesize contrasting author perspectives.
+7. **`extract_code_examples`** (`query`, optional `language`, `book_filter`, `category`, `top_k`):
+   Filters specifically for sections containing source code examples, CLI commands, SQL queries, or implementation patterns.
+8. **`deduplicate_books`** (optional `apply`):
+   Detects duplicate editions across the library (by ISBN or canonical `Title + Author`) and optionally removes lower-quality duplicates.
+9. **`save_note` / `list_notes` / `delete_note`**:
+   Saves and queries persistent bookmarks, highlights, and architectural notes linked to specific books/chapters/sections (automatically included in future RAG context).
+10. **`export_dossier`** (`topic`, optional `category`, `tag`, `output_path`, `top_k`):
+    Compiles a structured Markdown Study Guide / Technical Dossier combining multi-book excerpts, code examples, recommended chapters, and saved notes.
+11. **`enrich_books`** & **`remove_book`**:
+    Enriches books with live web metadata or removes books by ID, title, ISBN, or filename.
+12. **MCP Resources (`resources/list`, `resources/read`) & Prompts (`prompts/list`, `prompts/get`)**:
+    Exposes `library://catalog/overview`, `library://catalog/notes`, `library://catalog/duplicates`, and dynamic per-category resources (`library://category/<slug>`), plus built-in grounded prompts (`architecture-review`, `security-audit`, `code-refactoring`, `topic-study-guide`).

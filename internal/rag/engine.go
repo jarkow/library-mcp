@@ -52,6 +52,23 @@ type Engine struct {
 	qdrant             *qdrant.Client
 	enricher           *metadata.Enricher
 	ollamaOfflineUntil time.Time
+	watcherEvents      []WatcherEvent
+}
+
+func (e *Engine) recordWatcherEvent(ev WatcherEvent) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.watcherEvents = append([]WatcherEvent{ev}, e.watcherEvents...)
+	if len(e.watcherEvents) > 25 {
+		e.watcherEvents = e.watcherEvents[:25]
+	}
+}
+
+// RecentWatcherEvents returns the most recent live folder watcher events.
+func (e *Engine) RecentWatcherEvents() []WatcherEvent {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return append([]WatcherEvent(nil), e.watcherEvents...)
 }
 
 // NewEngine creates a new RAG Engine for the given configuration and store.
@@ -437,6 +454,17 @@ func (e *Engine) Ask(ctx context.Context, question, bookFilter string, topK int)
 	}
 
 	var contextBuilder strings.Builder
+	if notes := e.store.ListNotes(question, bookFilter, ""); len(notes) > 0 {
+		for i, n := range notes {
+			if i >= 3 {
+				break
+			}
+			contextBuilder.WriteString(fmt.Sprintf(
+				"--- SAVED NOTE %d [Title: %s | Book: %s | Chapter: %s] ---\n%s\n\n",
+				i+1, n.Title, n.BookTitle, n.ChapterTitle, n.Content,
+			))
+		}
+	}
 	for i, src := range sources {
 		ck := src.Chunk
 		parentContent := src.ParentText
