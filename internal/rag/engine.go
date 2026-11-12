@@ -11,11 +11,11 @@ import (
 	"sync"
 	"time"
 
-	"smart-library/internal/config"
-	"smart-library/internal/epub"
-	"smart-library/internal/ollama"
-	"smart-library/internal/qdrant"
-	"smart-library/internal/store"
+	"library-mcp/internal/config"
+	"library-mcp/internal/epub"
+	"library-mcp/internal/ollama"
+	"library-mcp/internal/qdrant"
+	"library-mcp/internal/store"
 )
 
 // IngestReport summarizes a batch or single-file ingestion run.
@@ -318,4 +318,3 @@ func (e *Engine) ListOllamaModels(ctx context.Context) ([]ollama.ModelInfo, erro
 	e.mu.RUnlock()
 	return client.ListModels(ctx)
 }
-

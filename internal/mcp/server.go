@@ -8,7 +8,7 @@ import (
 	"io"
 	"strings"
 
-	"smart-library/internal/rag"
+	"library-mcp/internal/rag"
 )
 
 type rpcRequest struct {
@@ -83,7 +83,7 @@ func (s *Server) handleRequest(ctx context.Context, req rpcRequest) rpcResponse 
 					"tools": map[string]any{},
 				},
 				"serverInfo": map[string]any{
-					"name":    "smart-library-mcp",
+					"name":    "library-mcp",
 					"version": "1.0.0",
 				},
 			},
@@ -236,4 +236,3 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		return fmt.Sprintf("Unknown tool: %s", name), true
 	}
 }
-

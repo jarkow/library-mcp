@@ -1,4 +1,6 @@
 # Binaries
+library-mcp
+library-mcp.exe
 smart-lib
 smart-lib.exe
 *.exe
@@ -17,3 +19,4 @@ data/
 .idea/
 .DS_Store
 Thumbs.db
+

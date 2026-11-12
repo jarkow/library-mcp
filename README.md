@@ -1,8 +1,8 @@
-# Smart Library (Go + Qdrant Edition)
+# Library MCP (Go + Qdrant Edition)
 
-A 100% local, structure-aware **Parent-Child Hierarchical RAG** system for technical EPUB books written in **Go (`golang`)**, backed by **Qdrant** (Hybrid Dense + Sparse RRF Search) and **Ollama** (`bge-m3` + `qwen2.5-coder:14b`).
+A 100% local, structure-aware **Parent-Child Hierarchical RAG** system and **Model Context Protocol (MCP)** server for technical EPUB books written in **Go (`golang`)**, backed by **Qdrant** (Hybrid Dense + Sparse RRF Search) and **Ollama** (`bge-m3` + `qwen2.5-coder:14b`).
 
-Works natively on **Windows (`smart-lib.exe`)**, **Linux**, and **WSL**.
+Works natively on **Windows (`library-mcp.exe`)**, **Linux**, and **WSL**.
 
 ---
 
@@ -18,40 +18,40 @@ ollama pull qwen2.5-coder:14b
 
 # 3. Format and build the Windows executable
 gofmt -w .
-go build -o smart-lib.exe .\cmd\smart-lib
+go build -o library-mcp.exe .\cmd\library-mcp
 ```
 
 ---
 
 ## 2. How to Feed It With New Books
 
-Smart Library computes a **SHA-256 hash** of every `.epub` file it indexes. Drop new `.epub` files into `H:\Books` anytime and run `ingest`—it **automatically skips already-indexed books** and only processes the new ones.
+Library MCP computes a **SHA-256 hash** of every `.epub` file it indexes. Drop new `.epub` files into `H:\Books` anytime and run `ingest`—it **automatically skips already-indexed books** and only processes the new ones.
 
 ### Option A: Ingest From Default `H:\Books`
 ```powershell
-.\smart-lib.exe ingest
+.\library-mcp.exe ingest
 ```
 
 ### Option B: Ingest From Any Other Folder on the Fly
 ```powershell
-.\smart-lib.exe ingest --dir "D:\MoreBooks"
+.\library-mcp.exe ingest --dir "D:\MoreBooks"
 ```
 
 ### Option C: Change the Default Books Folder Permanently
 ```powershell
-.\smart-lib.exe config --books-dir "H:\Books"
+.\library-mcp.exe config --books-dir "H:\Books"
 ```
 
 ### Option D: Force Re-Index All Books
 If you change chunk sizes or switch embedding models in `config.json`:
 ```powershell
-.\smart-lib.exe ingest --force
+.\library-mcp.exe ingest --force
 ```
 
 ### Option E: Via the Web UI
 Start the Web UI:
 ```powershell
-.\smart-lib.exe serve
+.\library-mcp.exe serve
 ```
 Open `http://127.0.0.1:8765` and click **Scan Books Dir** in the top bar, or click **+ Upload EPUB** in the left sidebar.
 
@@ -59,19 +59,19 @@ Open `http://127.0.0.1:8765` and click **Scan Books Dir** in the top bar, or cli
 
 ## 3. How to Start & Use It as an MCP Server on Windows
 
-The `smart-lib.exe` binary includes a built-in **Model Context Protocol (MCP)** server (`.\smart-lib.exe mcp`) over `stdio` JSON-RPC 2.0. Your AI client spawns it automatically—just ensure **Qdrant** (`docker compose up -d`) and **Ollama** are running.
+The `library-mcp.exe` binary includes a built-in **Model Context Protocol (MCP)** server (`.\library-mcp.exe mcp`) over `stdio` JSON-RPC 2.0. Your AI client spawns it automatically—just ensure **Qdrant** (`docker compose up -d`) and **Ollama** are running.
 
 ### A. Connect to Antigravity / Cursor / Claude Desktop on Windows
-Add `smart-library` to your MCP configuration file (replace `C:\\path\\to\\smart-library` with where you cloned the repo):
+Add `library-mcp` to your MCP configuration file (replace `C:\\path\\to\\library-mcp` with where you cloned the repo):
 
 ```json
 {
   "mcpServers": {
-    "smart-library": {
-      "command": "C:\\path\\to\\smart-library\\smart-lib.exe",
+    "library-mcp": {
+      "command": "C:\\path\\to\\library-mcp\\library-mcp.exe",
       "args": ["mcp"],
       "env": {
-        "SMART_LIBRARY_CONFIG": "C:\\path\\to\\smart-library\\config.json"
+        "SMART_LIBRARY_CONFIG": "C:\\path\\to\\library-mcp\\config.json"
       }
     }
   }
@@ -80,12 +80,12 @@ Add `smart-library` to your MCP configuration file (replace `C:\\path\\to\\smart
 
 ### B. Connect to Claude Code CLI on Windows
 ```powershell
-claude mcp add smart-library -- C:\path\to\smart-library\smart-lib.exe mcp
+claude mcp add library-mcp -- C:\path\to\library-mcp\library-mcp.exe mcp
 ```
 
 ### C. Sanity-Check the MCP Server in PowerShell
 ```powershell
-'{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | .\smart-lib.exe mcp
+'{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | .\library-mcp.exe mcp
 ```
 
 ### Tools Exposed to Your AI Agent via MCP

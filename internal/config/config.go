@@ -172,6 +172,10 @@ func Load(configPath string) (*Config, error) {
 	if b, err := os.ReadFile(configPath); err == nil {
 		if jsonErr := json.Unmarshal(b, cfg); jsonErr != nil {
 			log.Printf("Warning: could not parse %s: %v", configPath, jsonErr)
+		} else if !filepath.IsAbs(cfg.DataDir) {
+			if absCfg, absErr := filepath.Abs(configPath); absErr == nil {
+				cfg.DataDir = filepath.Join(filepath.Dir(absCfg), cfg.DataDir)
+			}
 		}
 	}
 
@@ -267,17 +271,17 @@ func (c *Config) Sanitize() {
 }
 
 // ResolvedBooksDir returns the OS-resolved books directory path.
-func (c *Config) ResolvedBooksDir() string {
+func (c Config) ResolvedBooksDir() string {
 	return TranslatePath(c.BooksDir)
 }
 
 // ResolvedDataDir returns the OS-resolved data directory path.
-func (c *Config) ResolvedDataDir() string {
+func (c Config) ResolvedDataDir() string {
 	return TranslatePath(c.DataDir)
 }
 
 // UploadsDir returns the secure directory for uploaded EPUB files outside the web root.
-func (c *Config) UploadsDir() string {
+func (c Config) UploadsDir() string {
 	return filepath.Join(c.ResolvedDataDir(), "uploads")
 }
 

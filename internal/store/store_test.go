@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"smart-library/internal/epub"
+	"library-mcp/internal/epub"
 )
 
 func TestParentChildPromotionAndHybridFallback(t *testing.T) {
@@ -95,4 +95,3 @@ func TestParentChildPromotionAndHybridFallback(t *testing.T) {
 		t.Errorf("expected promoted ParentText to match full ParentSection content")
 	}
 }
-

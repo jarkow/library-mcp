@@ -13,7 +13,7 @@ import (
 	"time"
 	"unicode"
 
-	"smart-library/internal/epub"
+	"library-mcp/internal/epub"
 )
 
 // SparseVector represents a Qdrant sparse vector of sorted token hash indices and TF weights.
@@ -408,4 +408,3 @@ func BuildSparseVector(text string) SparseVector {
 		Values:  values,
 	}
 }
-

@@ -107,4 +107,3 @@ func createSyntheticEPUB(filePath string) error {
 	}
 	return nil
 }
-

@@ -18,9 +18,9 @@ import (
 	"sync"
 	"time"
 
-	"smart-library/internal/config"
-	"smart-library/internal/epub"
-	"smart-library/internal/rag"
+	"library-mcp/internal/config"
+	"library-mcp/internal/epub"
+	"library-mcp/internal/rag"
 )
 
 //go:embed static/*
@@ -240,19 +240,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	_, dirErr := os.Stat(resolvedBooksPath)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"config":              cfg,
-		"resolved_books_dir":  resolvedBooksPath,
-		"books_dir_exists":    dirErr == nil,
-		"books_count":         booksCount,
-		"chapters_count":      chaptersCount,
-		"parents_count":       parentsCount,
-		"chunks_count":        chunksCount,
-		"vectors_count":       vectorsCount,
-		"qdrant_online":       qdrantOK,
-		"qdrant_dashboard":    strings.TrimRight(cfg.QdrantURL, "/") + "/dashboard",
-		"ollama_online":       ollamaErr == nil,
-		"ollama_models":       modelNames,
-		"retrieval_strategy":  "Parent-Child Hierarchical + Qdrant Hybrid RRF (Dense + Sparse)",
+		"config":             cfg,
+		"resolved_books_dir": resolvedBooksPath,
+		"books_dir_exists":   dirErr == nil,
+		"books_count":        booksCount,
+		"chapters_count":     chaptersCount,
+		"parents_count":      parentsCount,
+		"chunks_count":       chunksCount,
+		"vectors_count":      vectorsCount,
+		"qdrant_online":      qdrantOK,
+		"qdrant_dashboard":   strings.TrimRight(cfg.QdrantURL, "/") + "/dashboard",
+		"ollama_online":      ollamaErr == nil,
+		"ollama_models":      modelNames,
+		"retrieval_strategy": "Parent-Child Hierarchical + Qdrant Hybrid RRF (Dense + Sparse)",
 	})
 }
 
@@ -596,4 +596,3 @@ func randomHex(numBytes int) string {
 	}
 	return hex.EncodeToString(b)
 }
-

@@ -17,8 +17,8 @@ import (
 	"time"
 	"unicode"
 
-	"smart-library/internal/epub"
-	"smart-library/internal/qdrant"
+	"library-mcp/internal/epub"
+	"library-mcp/internal/qdrant"
 )
 
 // BookRecord stores metadata for an indexed EPUB book.

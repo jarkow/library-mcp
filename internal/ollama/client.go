@@ -195,4 +195,3 @@ func (c *Client) Chat(ctx context.Context, model string, messages []ChatMessage)
 	}
 	return result.Message.Content, nil
 }
-
