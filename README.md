@@ -69,25 +69,37 @@ flowchart LR
 
 ---
 
-## SQLite (`data/library.db`) vs. Qdrant: Why Both Exist & What Each Does
+## SQLite (`data/library.db`) vs. Qdrant: What Each One Does (In Plain English)
 
-In a **Parent-Child Hierarchical RAG** architecture over 200+ books (`348,870` child chunks, `87,185` parent sections, `8,938` full chapters), **Qdrant** and **SQLite** have distinct, complementary jobs:
+When the program reads one of your books, it splits the book into three sizes:
+1. **Whole Chapters** (10–30 pages of text — used when you want to read an entire chapter).
+2. **Medium Sections ("Parent Sections")** (~1–2 pages of text — big enough to hold a complete explanation and a full code example without cutting it in half).
+3. **Small Paragraphs ("Child Chunks")** (a single short paragraph — small enough to accurately match a specific question).
 
-| Responsibility | Qdrant Vector DB (`data/qdrant_storage/`) | SQLite + FTS5 (`data/library.db`) |
-| :--- | :--- | :--- |
-| **Primary Role** | **Semantic & Hybrid Vector Search Engine** (finding *which* fine-grained 650-char Child Chunks match a concept). | **Relational Document Store, Hierarchy Catalog & FTS5 Engine** (storing full text, hierarchy, metadata, notes, and offline search). |
-| **What It Stores** | Only **Child Chunks (~650 chars)** + **Dense `bge-m3` embeddings** (1024-dim float vectors) + **Sparse IDF vectors**. | **Everything**: `books` (metadata, ISBN, categories, tags), full `chapters` (10k–50k chars), `parents` (~3,200-char sections), `chunks`, `notes`, and the `chunks_fts` FTS5 index. |
-| **Why It's Needed** | SQLite cannot do fast Approximate Nearest Neighbor (HNSW) vector search over 350,000 high-dimensional `bge-m3` embeddings or Reciprocal Rank Fusion (RRF) across dense + sparse vectors. | Storing 8,938 full chapters and 87,185 3,200-character parent sections inside Qdrant point payloads would bloat Qdrant's memory and disk footprint, and Qdrant is not a relational database for TOC trees, chapter reading, or user notes. |
-| **How They Work Together During Search** | **Step 1 (Discovery)**: Qdrant searches 348,870 Child Chunks by meaning (`bge-m3` dense vectors) + keywords (sparse vectors) and returns the winning `parent_id`s. | **Step 2 (Promotion & Hydration)**: SQLite takes those `parent_id`s and fetches the complete **~3,200-character Parent Section** (with intact code blocks and headings) in `<2ms` by primary key. |
-| **When Docker / Qdrant is Offline** | Not running / unreachable. | **100% Zero-Downtime Fallback**: SQLite's built-in **FTS5 (`chunks_fts`)** full-text index with BM25 ranking automatically takes over so CLI and MCP tools (`search_books`, `get_book_toc`, `get_chapter`, `compare_books_on_topic`, etc.) still work in milliseconds without Docker. |
+Because your library has **205 books** (over **348,000 paragraphs**), we use two databases that each do what they are best at:
 
-### Summary of Which Tool Uses Which Database
-- **Uses SQLite (`data/library.db`) directly**:
-  - `list_books`, `get_book_toc`, `search_chapters`, `get_chapter`, `deduplicate_books`, `save_note` / `list_notes` / `delete_note`, `enrich_books`, `remove_book`.
-  - Fetching the full **Parent Section** (`parents` table) after a search hit.
-  - Fast keyword/BM25 search via `chunks_fts` when Qdrant is offline or when running in `-mode keyword`.
-- **Uses Qdrant (`127.0.0.1:6333`) + SQLite together**:
-  - `search_books`, `compare_books_on_topic`, `extract_code_examples`, `export_dossier`, and `ask_library` (when Qdrant + Ollama `bge-m3` are online, Qdrant performs the HNSW semantic + sparse RRF search over child chunks, and SQLite promotes the matches to full Parent Sections and filters by book category/tags/year).
+### 1. What SQLite (`data/library.db`) Is For: **The Library Catalog & Book Text Storage**
+Think of **SQLite** as the actual **library shelves and card catalog** stored in a single local file (`data/library.db`):
+- **Stores all the book text and structure**: Every book's title, author, category, tags, table of contents, full chapters, medium sections, and your personal notes live here.
+- **Instant lookups by ID or filter**: When you ask *"Show me all books in the Security category"*, *"Show me the Table of Contents of Book X"*, or *"Open Chapter 3"*, SQLite answers in a few milliseconds.
+- **Built-in Keyword Search (Works without Docker)**: SQLite also has a built-in word search index. If you search for exact words like `"io.LimitReader"` or `"bounded context"`—or if Docker is turned off—SQLite can search all 348,000 paragraphs by keywords on its own in ~0.25 seconds.
+
+### 2. What Qdrant (`data/qdrant_storage/`) Is For: **Searching by Meaning ("AI Concept Search")**
+Think of **Qdrant** as a specialized **AI index that understands meaning, not just exact words**:
+- **Finds ideas even when the words don't match**: Suppose you search for *"how to stop a service from overloading when another server fails"*. A book might call that a *"circuit breaker pattern"* without ever using the word *"overloading"*. Keyword search would miss it, but Qdrant finds it because their **meaning** (represented as number vectors created by Ollama) is close.
+- **Only stores the small paragraphs**: We don't put entire chapters into Qdrant because that would waste gigabytes of RAM. Instead, Qdrant only indexes the small paragraphs and remembers which **Medium Section ID** (`parent_id`) each paragraph came from.
+
+### 3. How They Work Together When You Search
+1. **Qdrant finds the matching paragraph**: You ask a question. Qdrant searches the 348,000 small paragraphs by **meaning + keywords** and finds the best matches.
+2. **SQLite fetches the complete surrounding section**: Instead of giving the AI just one tiny paragraph (where code might be cut off), the program takes the matching paragraph's section ID and asks **SQLite** for the full **1–2 page Medium Section** (`Parent Section`), plus the book's metadata and any notes you saved.
+3. **If Qdrant/Docker isn't running**: The program automatically falls back to **SQLite's built-in keyword search**, so everything still works offline without Docker.
+
+| Question / Action | Which Database Handles It? |
+| :--- | :--- |
+| List books, filter by category/tag/author, view Table of Contents | **SQLite** (`data/library.db`) |
+| Read a full chapter or save/search personal notes | **SQLite** (`data/library.db`) |
+| Search books by **meaning / concept** (when Docker + Ollama are running) | **Qdrant** finds the paragraph $\rightarrow$ **SQLite** returns the full section |
+| Search books by **keywords** (or anytime Docker is turned off) | **SQLite** (`data/library.db`) |
 
 ---
 
