@@ -63,9 +63,31 @@ flowchart LR
     WEB --> LOC
     P3 --> QD
     P3 --> LOC
-    QD <-->|"RRF Search + Parent Promotion"| Consumers
-    LOC <-->|"Parent/Chapter Lookup & Fallback"| Consumers
+    QD <-->|"1. Find Top Child Chunks (Vector + RRF)"| Consumers
+    LOC <-->|"2. Promote to Full Parent Sections / Chapters / TOC / FTS5"| Consumers
 ```
+
+---
+
+## SQLite (`data/library.db`) vs. Qdrant: Why Both Exist & What Each Does
+
+In a **Parent-Child Hierarchical RAG** architecture over 200+ books (`348,870` child chunks, `87,185` parent sections, `8,938` full chapters), **Qdrant** and **SQLite** have distinct, complementary jobs:
+
+| Responsibility | Qdrant Vector DB (`data/qdrant_storage/`) | SQLite + FTS5 (`data/library.db`) |
+| :--- | :--- | :--- |
+| **Primary Role** | **Semantic & Hybrid Vector Search Engine** (finding *which* fine-grained 650-char Child Chunks match a concept). | **Relational Document Store, Hierarchy Catalog & FTS5 Engine** (storing full text, hierarchy, metadata, notes, and offline search). |
+| **What It Stores** | Only **Child Chunks (~650 chars)** + **Dense `bge-m3` embeddings** (1024-dim float vectors) + **Sparse IDF vectors**. | **Everything**: `books` (metadata, ISBN, categories, tags), full `chapters` (10k–50k chars), `parents` (~3,200-char sections), `chunks`, `notes`, and the `chunks_fts` FTS5 index. |
+| **Why It's Needed** | SQLite cannot do fast Approximate Nearest Neighbor (HNSW) vector search over 350,000 high-dimensional `bge-m3` embeddings or Reciprocal Rank Fusion (RRF) across dense + sparse vectors. | Storing 8,938 full chapters and 87,185 3,200-character parent sections inside Qdrant point payloads would bloat Qdrant's memory and disk footprint, and Qdrant is not a relational database for TOC trees, chapter reading, or user notes. |
+| **How They Work Together During Search** | **Step 1 (Discovery)**: Qdrant searches 348,870 Child Chunks by meaning (`bge-m3` dense vectors) + keywords (sparse vectors) and returns the winning `parent_id`s. | **Step 2 (Promotion & Hydration)**: SQLite takes those `parent_id`s and fetches the complete **~3,200-character Parent Section** (with intact code blocks and headings) in `<2ms` by primary key. |
+| **When Docker / Qdrant is Offline** | Not running / unreachable. | **100% Zero-Downtime Fallback**: SQLite's built-in **FTS5 (`chunks_fts`)** full-text index with BM25 ranking automatically takes over so CLI and MCP tools (`search_books`, `get_book_toc`, `get_chapter`, `compare_books_on_topic`, etc.) still work in milliseconds without Docker. |
+
+### Summary of Which Tool Uses Which Database
+- **Uses SQLite (`data/library.db`) directly**:
+  - `list_books`, `get_book_toc`, `search_chapters`, `get_chapter`, `deduplicate_books`, `save_note` / `list_notes` / `delete_note`, `enrich_books`, `remove_book`.
+  - Fetching the full **Parent Section** (`parents` table) after a search hit.
+  - Fast keyword/BM25 search via `chunks_fts` when Qdrant is offline or when running in `-mode keyword`.
+- **Uses Qdrant (`127.0.0.1:6333`) + SQLite together**:
+  - `search_books`, `compare_books_on_topic`, `extract_code_examples`, `export_dossier`, and `ask_library` (when Qdrant + Ollama `bge-m3` are online, Qdrant performs the HNSW semantic + sparse RRF search over child chunks, and SQLite promotes the matches to full Parent Sections and filters by book category/tags/year).
 
 ---
 
