@@ -38,13 +38,14 @@ type Enricher struct {
 	HTTPClient    *http.Client
 	GoogleBaseURL string
 	OpenLibURL    string
+	offlineUntil  time.Time
 }
 
 // NewEnricher creates a web metadata Enricher with a bounded timeout.
 func NewEnricher() *Enricher {
 	return &Enricher{
 		HTTPClient: &http.Client{
-			Timeout: 8 * time.Second,
+			Timeout: 4 * time.Second,
 		},
 		GoogleBaseURL: "https://www.googleapis.com/books/v1/volumes",
 		OpenLibURL:    "https://openlibrary.org/search.json",
@@ -89,17 +90,23 @@ func (e *Enricher) Enrich(ctx context.Context, seed BookMetadata, chapterTitles 
 	}
 
 	var sources []string
-	if out.Title != "" || out.ISBN != "" {
-		gbMeta, gbOK := e.fetchGoogleBooks(ctx, out.Title, out.Author, out.ISBN)
-		if gbOK {
-			out = mergeMetadata(out, gbMeta)
-			sources = append(sources, "google_books")
-		}
+	if (out.Title != "" || out.ISBN != "") && time.Now().After(e.offlineUntil) {
+		gbMeta, gbOK, netErr := e.fetchGoogleBooks(ctx, out.Title, out.Author, out.ISBN)
+		if netErr {
+			e.offlineUntil = time.Now().Add(60 * time.Second)
+		} else {
+			if gbOK {
+				out = mergeMetadata(out, gbMeta)
+				sources = append(sources, "google_books")
+			}
 
-		olMeta, olOK := e.fetchOpenLibrary(ctx, out.Title, out.Author, out.ISBN)
-		if olOK {
-			out = mergeMetadata(out, olMeta)
-			sources = append(sources, "openlibrary")
+			olMeta, olOK, olNetErr := e.fetchOpenLibrary(ctx, out.Title, out.Author, out.ISBN)
+			if olNetErr {
+				e.offlineUntil = time.Now().Add(60 * time.Second)
+			} else if olOK {
+				out = mergeMetadata(out, olMeta)
+				sources = append(sources, "openlibrary")
+			}
 		}
 	}
 
@@ -160,9 +167,9 @@ func mergeMetadata(base, web BookMetadata) BookMetadata {
 	return base
 }
 
-func (e *Enricher) fetchGoogleBooks(ctx context.Context, title, author, isbn string) (BookMetadata, bool) {
+func (e *Enricher) fetchGoogleBooks(ctx context.Context, title, author, isbn string) (BookMetadata, bool, bool) {
 	if e.GoogleBaseURL == "" {
-		return BookMetadata{}, false
+		return BookMetadata{}, false, false
 	}
 
 	var query string
@@ -186,18 +193,18 @@ func (e *Enricher) fetchGoogleBooks(ctx context.Context, title, author, isbn str
 	reqURL := fmt.Sprintf("%s?q=%s&maxResults=3", e.GoogleBaseURL, url.QueryEscape(query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return BookMetadata{}, false
+		return BookMetadata{}, false, false
 	}
 	req.Header.Set("User-Agent", "library-mcp/1.0 (https://github.com/jarkow/library-mcp)")
 
 	resp, err := e.HTTPClient.Do(req)
 	if err != nil {
-		return BookMetadata{}, false
+		return BookMetadata{}, false, true
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return BookMetadata{}, false
+		return BookMetadata{}, false, false
 	}
 
 	var payload struct {
@@ -225,7 +232,7 @@ func (e *Enricher) fetchGoogleBooks(ctx context.Context, title, author, isbn str
 	}
 
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&payload); err != nil || len(payload.Items) == 0 {
-		return BookMetadata{}, false
+		return BookMetadata{}, false, false
 	}
 
 	vi := payload.Items[0].VolumeInfo
@@ -258,12 +265,12 @@ func (e *Enricher) fetchGoogleBooks(ctx context.Context, title, author, isbn str
 		Subjects:      vi.Categories,
 		CoverURL:      strings.Replace(vi.ImageLinks.Thumbnail, "http://", "https://", 1),
 		WebURL:        vi.InfoLink,
-	}, true
+	}, true, false
 }
 
-func (e *Enricher) fetchOpenLibrary(ctx context.Context, title, author, isbn string) (BookMetadata, bool) {
+func (e *Enricher) fetchOpenLibrary(ctx context.Context, title, author, isbn string) (BookMetadata, bool, bool) {
 	if e.OpenLibURL == "" {
-		return BookMetadata{}, false
+		return BookMetadata{}, false, false
 	}
 
 	params := url.Values{}
@@ -286,18 +293,18 @@ func (e *Enricher) fetchOpenLibrary(ctx context.Context, title, author, isbn str
 	reqURL := e.OpenLibURL + "?" + params.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return BookMetadata{}, false
+		return BookMetadata{}, false, false
 	}
 	req.Header.Set("User-Agent", "library-mcp/1.0 (https://github.com/jarkow/library-mcp)")
 
 	resp, err := e.HTTPClient.Do(req)
 	if err != nil {
-		return BookMetadata{}, false
+		return BookMetadata{}, false, true
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return BookMetadata{}, false
+		return BookMetadata{}, false, false
 	}
 
 	var payload struct {
@@ -316,7 +323,7 @@ func (e *Enricher) fetchOpenLibrary(ctx context.Context, title, author, isbn str
 	}
 
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&payload); err != nil || len(payload.Docs) == 0 {
-		return BookMetadata{}, false
+		return BookMetadata{}, false, false
 	}
 
 	doc := payload.Docs[0]
@@ -365,7 +372,7 @@ func (e *Enricher) fetchOpenLibrary(ctx context.Context, title, author, isbn str
 		Subjects:      doc.Subject[:maxSubj],
 		CoverURL:      coverURL,
 		WebURL:        webURL,
-	}, true
+	}, true, false
 }
 
 type categoryRule struct {

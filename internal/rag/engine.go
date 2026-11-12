@@ -45,12 +45,13 @@ type AskResponse struct {
 
 // Engine coordinates EPUB ingestion, web metadata enrichment, Qdrant hybrid retrieval, Parent-Child promotion, and Ollama generation.
 type Engine struct {
-	mu       sync.RWMutex
-	cfg      *config.Config
-	store    *store.Store
-	ollama   *ollama.Client
-	qdrant   *qdrant.Client
-	enricher *metadata.Enricher
+	mu                 sync.RWMutex
+	cfg                *config.Config
+	store              *store.Store
+	ollama             *ollama.Client
+	qdrant             *qdrant.Client
+	enricher           *metadata.Enricher
+	ollamaOfflineUntil time.Time
 }
 
 // NewEngine creates a new RAG Engine for the given configuration and store.
@@ -148,6 +149,19 @@ func (e *Engine) IngestDir(ctx context.Context, dirPath string, force bool, prog
 		ScannedFiles: len(epubFiles),
 	}
 
+	qdrantOnline := e.CheckQdrant(ctx)
+	if !qdrantOnline {
+		e.store.SetQdrantClient(nil)
+		defer func() {
+			e.mu.RLock()
+			qc := e.qdrant
+			e.mu.RUnlock()
+			e.store.SetQdrantClient(qc)
+		}()
+	}
+
+	e.store.SetBatchMode(true)
+
 	for i, filePath := range epubFiles {
 		relDisplay := filepath.Base(filePath)
 		if rel, relErr := filepath.Rel(targetDir, filePath); relErr == nil && rel != "" && rel != "." {
@@ -173,12 +187,14 @@ func (e *Engine) IngestDir(ctx context.Context, dirPath string, force bool, prog
 		}
 	}
 
-	// Ensure any existing books lacking web metadata/category/tags are also enriched
-	if enrichedBooks, err := e.EnrichAllBooks(ctx, false); err == nil {
-		report.Books = enrichedBooks
-	} else {
-		report.Books = e.store.ListBooks()
+	// Ensure any existing books lacking category/tags are also enriched, then flush once
+	for _, b := range e.store.ListBooks() {
+		if b.Category == "" || len(b.Tags) == 0 {
+			_, _ = e.EnrichBook(ctx, b.ID)
+		}
 	}
+	_ = e.store.Flush()
+	report.Books = e.store.ListBooks()
 
 	report.DurationMs = time.Since(start).Milliseconds()
 	return report, nil
@@ -322,6 +338,7 @@ func (e *Engine) EnrichBook(ctx context.Context, bookID string) (store.BookRecor
 
 // EnrichAllBooks enriches all indexed books (or only those missing web metadata/category/tags when force is false).
 func (e *Engine) EnrichAllBooks(ctx context.Context, force bool) ([]store.BookRecord, error) {
+	e.store.SetBatchMode(true)
 	books := e.store.ListBooks()
 	for _, b := range books {
 		needsEnrich := force || b.Category == "" || len(b.Tags) == 0 || b.MetadataSource == "" || b.MetadataSource == "epub"
@@ -332,6 +349,9 @@ func (e *Engine) EnrichAllBooks(ctx context.Context, force bool) ([]store.BookRe
 			log.Printf("Warning: could not enrich book %s (%s): %v", b.ID, b.Title, err)
 		}
 	}
+	if err := e.store.Flush(); err != nil {
+		return e.store.ListBooks(), err
+	}
 	return e.store.ListBooks(), nil
 }
 
@@ -339,7 +359,12 @@ func (e *Engine) embedChunksWithBatching(ctx context.Context, chunks []epub.Pars
 	cfg := e.GetConfig()
 	e.mu.RLock()
 	client := e.ollama
+	offlineUntil := e.ollamaOfflineUntil
 	e.mu.RUnlock()
+
+	if time.Now().Before(offlineUntil) {
+		return nil, false
+	}
 
 	const batchSize = 32
 	allVecs := make([][]float32, 0, len(chunks))
@@ -356,6 +381,9 @@ func (e *Engine) embedChunksWithBatching(ctx context.Context, chunks []epub.Pars
 
 		vecs, err := client.EmbedBatch(ctx, cfg.EmbeddingModel, texts)
 		if err != nil {
+			e.mu.Lock()
+			e.ollamaOfflineUntil = time.Now().Add(60 * time.Second)
+			e.mu.Unlock()
 			log.Printf("Note: Ollama embedding (%s) unavailable, indexing sparse vectors & BM25: %v", cfg.EmbeddingModel, err)
 			return nil, false
 		}

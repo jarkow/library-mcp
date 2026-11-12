@@ -86,6 +86,7 @@ type Store struct {
 	postings  map[string]map[int]int
 	docLen    []int
 	avgDocLen float64
+	batchMode bool
 }
 
 // Open initializes a Store backed by Qdrant and the local Parent/Chapter catalog in dataDir.
@@ -178,6 +179,22 @@ func (s *Store) load() error {
 func (s *Store) Save() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.saveLocked()
+}
+
+// SetBatchMode enables or disables deferred BM25 rebuild and disk persistence during bulk ingestion.
+func (s *Store) SetBatchMode(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.batchMode = enabled
+}
+
+// Flush rebuilds the in-memory BM25 index and saves the catalog and vectors to disk.
+func (s *Store) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.batchMode = false
+	s.rebuildBM25Locked()
 	return s.saveLocked()
 }
 
@@ -310,6 +327,9 @@ func (s *Store) UpsertBook(ctx context.Context, book *epub.ParsedBook, embedding
 		s.vectors = append(s.vectors, normEmbeddings[i])
 	}
 
+	if s.batchMode {
+		return nil
+	}
 	s.rebuildBM25Locked()
 	return s.saveLocked()
 }
@@ -559,6 +579,9 @@ func (s *Store) UpdateBookMetadata(bookID string, meta metadata.BookMetadata) (B
 	}
 
 	s.books[bookID] = rec
+	if s.batchMode {
+		return rec, nil
+	}
 	if err := s.saveLocked(); err != nil {
 		return rec, err
 	}
