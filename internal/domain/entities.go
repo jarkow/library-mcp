@@ -135,6 +135,27 @@ type SearchOptions struct {
 	TopK       int    `json:"top_k,omitempty"`
 }
 
+// BookFilter narrows a catalog listing. Empty fields are ignored.
+type BookFilter struct {
+	Category string `json:"category,omitempty"`
+	Tag      string `json:"tag,omitempty"`
+	Author   string `json:"author,omitempty"`
+	YearMin  int    `json:"year_min,omitempty"`
+}
+
+// CatalogOverview summarizes the whole catalog (counts, taxonomy, notes, duplicates).
+type CatalogOverview struct {
+	Books           int      `json:"books"`
+	Chapters        int      `json:"chapters"`
+	Parents         int      `json:"parents"`
+	Chunks          int      `json:"chunks"`
+	Vectors         int      `json:"vectors"`
+	Categories      []string `json:"categories"`
+	Tags            []string `json:"tags"`
+	NotesCount      int      `json:"notes_count"`
+	DuplicatesCount int      `json:"duplicates_count"`
+}
+
 // SearchResult represents a hierarchical retrieval result containing both the
 // matched child chunk and its promoted ParentSection.
 type SearchResult struct {

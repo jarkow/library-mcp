@@ -26,6 +26,25 @@ type LibraryService interface {
 	RecentWatcherEvents() []WatcherEvent
 	CheckQdrant(ctx context.Context) bool
 	ListOllamaModels(ctx context.Context) ([]ModelInfo, error)
+
+	// Catalog use cases (shared by CLI, MCP and Web adapters).
+	ListBooks(filter BookFilter) []BookRecord
+	GetBookRecord(bookID string) (BookRecord, bool)
+	GetBook(bookID string) (BookRecord, []ParsedChapter, bool)
+	GetBookTOC(idOrQuery string) (*BookTOC, error)
+	SearchChapters(query, bookFilter, category, tag string, topK int) []ChapterSearchHit
+	GetChapter(chapterID string) (ParsedChapter, bool)
+	GetParentSection(parentID string) (ParentSection, bool)
+	ListCategoriesAndTags() ([]string, []string)
+	CatalogOverview() CatalogOverview
+	SaveNote(note NoteRecord) (NoteRecord, error)
+	ListNotes(query, bookFilter, tag string) []NoteRecord
+	DeleteNote(noteID string) (NoteRecord, error)
+	FindDuplicates() []DuplicateGroup
+	DeduplicateBooks(ctx context.Context, apply bool) (*DedupReport, error)
+	RemoveBook(ctx context.Context, idOrQuery string) (BookRecord, error)
+	RemoveAllBooks(ctx context.Context) (int, error)
+	SyncToQdrant(ctx context.Context) error
 }
 
 // ============================================================================

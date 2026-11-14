@@ -14,14 +14,15 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"library-mcp/internal/config"
+	"library-mcp/internal/domain"
 	"library-mcp/internal/epub"
 	"library-mcp/internal/rag"
-	"library-mcp/internal/store"
 )
 
 //go:embed static/*
@@ -238,7 +239,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	cfg := s.engine.GetConfig()
-	booksCount, chaptersCount, parentsCount, chunksCount, vectorsCount := s.engine.Store().Stats()
+	overview := s.engine.CatalogOverview()
 	qdrantOK := s.engine.CheckQdrant(ctx)
 	models, ollamaErr := s.engine.ListOllamaModels(ctx)
 
@@ -254,13 +255,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"config":             cfg,
 		"resolved_books_dir": resolvedBooksPath,
 		"books_dir_exists":   dirErr == nil,
-		"books_count":        booksCount,
-		"chapters_count":     chaptersCount,
-		"parents_count":      parentsCount,
-		"chunks_count":       chunksCount,
-		"vectors_count":      vectorsCount,
-		"notes_count":        len(s.engine.Store().ListNotes("", "", "")),
-		"duplicates_count":   len(s.engine.Store().FindDuplicates()),
+		"books_count":        overview.Books,
+		"chapters_count":     overview.Chapters,
+		"parents_count":      overview.Parents,
+		"chunks_count":       overview.Chunks,
+		"vectors_count":      overview.Vectors,
+		"notes_count":        overview.NotesCount,
+		"duplicates_count":   overview.DuplicatesCount,
 		"watcher_events":     s.engine.RecentWatcherEvents(),
 		"qdrant_online":      qdrantOK,
 		"qdrant_dashboard":   strings.TrimRight(cfg.QdrantURL, "/") + "/dashboard",
@@ -273,8 +274,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleBooks(w http.ResponseWriter, r *http.Request) {
 	cat := strings.TrimSpace(r.URL.Query().Get("category"))
 	tag := strings.TrimSpace(r.URL.Query().Get("tag"))
-	books := s.engine.Store().ListBooksFiltered(cat, tag)
-	categories, tags := s.engine.Store().ListCategoriesAndTags()
+	books := s.engine.ListBooks(domain.BookFilter{
+		Category: cat,
+		Tag:      tag,
+		Author:   strings.TrimSpace(r.URL.Query().Get("author")),
+		YearMin:  atoiDefault(r.URL.Query().Get("year_min")),
+	})
+	categories, tags := s.engine.ListCategoriesAndTags()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"books":      books,
 		"categories": categories,
@@ -320,7 +326,7 @@ func (s *Server) handleBookDetail(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "Missing book id parameter.")
 		return
 	}
-	book, chapters, ok := s.engine.Store().GetBook(bookID)
+	book, chapters, ok := s.engine.GetBook(bookID)
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "Book not found.")
 		return
@@ -337,7 +343,7 @@ func (s *Server) handleChapter(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "Missing chapter id parameter.")
 		return
 	}
-	chap, ok := s.engine.Store().GetChapter(chapID)
+	chap, ok := s.engine.GetChapter(chapID)
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "Chapter not found.")
 		return
@@ -353,7 +359,7 @@ func (s *Server) handleParentSection(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "Missing parent section id parameter.")
 		return
 	}
-	parent, ok := s.engine.Store().GetParentSection(parentID)
+	parent, ok := s.engine.GetParentSection(parentID)
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "Parent section not found.")
 		return
@@ -368,7 +374,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "POST required.")
 		return
 	}
-	var req store.SearchOptions
+	var req domain.SearchOptions
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "Invalid JSON request body.")
 		return
@@ -393,7 +399,7 @@ func (s *Server) handleBookTOC(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "Missing book id parameter.")
 		return
 	}
-	toc, err := s.engine.Store().GetBookTOC(bookID)
+	toc, err := s.engine.GetBookTOC(bookID)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
@@ -417,7 +423,7 @@ func (s *Server) handleSearchChapters(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "Missing query.")
 		return
 	}
-	hits := s.engine.Store().SearchChapters(req.Query, req.BookFilter, req.Category, req.Tag, req.TopK)
+	hits := s.engine.SearchChapters(req.Query, req.BookFilter, req.Category, req.Tag, req.TopK)
 	writeJSON(w, http.StatusOK, map[string]any{"chapters": hits})
 }
 
@@ -495,7 +501,7 @@ func (s *Server) handleDedupBooks(w http.ResponseWriter, r *http.Request) {
 		Apply bool `json:"apply"`
 	}
 	_ = json.NewDecoder(io.LimitReader(r.Body, 8*1024)).Decode(&req)
-	rep, err := s.engine.Store().DeduplicateBooks(r.Context(), req.Apply)
+	rep, err := s.engine.DeduplicateBooks(r.Context(), req.Apply)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -508,17 +514,17 @@ func (s *Server) handleNotes(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("query")
 		bf := r.URL.Query().Get("book_filter")
 		tag := r.URL.Query().Get("tag")
-		notes := s.engine.Store().ListNotes(q, bf, tag)
+		notes := s.engine.ListNotes(q, bf, tag)
 		writeJSON(w, http.StatusOK, map[string]any{"notes": notes})
 		return
 	}
 	if r.Method == http.MethodPost {
-		var note store.NoteRecord
+		var note domain.NoteRecord
 		if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&note); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "Invalid note JSON.")
 			return
 		}
-		saved, err := s.engine.Store().SaveNote(note)
+		saved, err := s.engine.SaveNote(note)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
@@ -541,7 +547,7 @@ func (s *Server) handleDeleteNote(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "Missing note_id.")
 		return
 	}
-	deleted, err := s.engine.Store().DeleteNote(req.NoteID)
+	deleted, err := s.engine.DeleteNote(req.NoteID)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
@@ -745,7 +751,7 @@ func (s *Server) handleDeleteBook(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "Missing book_id.")
 		return
 	}
-	removed, err := s.engine.Store().RemoveBook(r.Context(), strings.TrimSpace(req.BookID))
+	removed, err := s.engine.RemoveBook(r.Context(), strings.TrimSpace(req.BookID))
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
@@ -761,7 +767,7 @@ func (s *Server) handleQdrantSync(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "POST required.")
 		return
 	}
-	if err := s.engine.Store().SyncAllToQdrant(r.Context()); err != nil {
+	if err := s.engine.SyncToQdrant(r.Context()); err != nil {
 		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("Qdrant sync failed: %v", err))
 		return
 	}
@@ -808,4 +814,9 @@ func randomHex(numBytes int) string {
 		panic(err)
 	}
 	return hex.EncodeToString(b)
+}
+
+func atoiDefault(s string) int {
+	n, _ := strconv.Atoi(strings.TrimSpace(s))
+	return n
 }

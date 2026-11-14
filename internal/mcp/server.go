@@ -7,11 +7,10 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"strconv"
 	"strings"
 
+	"library-mcp/internal/domain"
 	"library-mcp/internal/rag"
-	"library-mcp/internal/store"
 )
 
 type rpcRequest struct {
@@ -560,7 +559,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		if strings.TrimSpace(query) == "" {
 			return "Error: 'query' parameter is required.", true
 		}
-		opts := store.SearchOptions{
+		opts := domain.SearchOptions{
 			Query:      query,
 			Mode:       "hybrid",
 			BookFilter: stringArg(args, "book_filter"),
@@ -580,28 +579,12 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		return s.formatSearchResults(results), false
 
 	case "list_books":
-		catFilter := stringArg(args, "category")
-		tagFilter := stringArg(args, "tag")
-		authorFilter := strings.ToLower(stringArg(args, "author"))
-		yearMin := intArg(args, "year_min", 0)
-
-		books := s.engine.Store().ListBooksFiltered(catFilter, tagFilter)
-		if authorFilter != "" || yearMin > 0 {
-			filtered := make([]store.BookRecord, 0, len(books))
-			for _, b := range books {
-				if authorFilter != "" && !strings.Contains(strings.ToLower(b.Author), authorFilter) {
-					continue
-				}
-				if yearMin > 0 {
-					yr, _ := strconv.Atoi(strings.TrimSpace(b.PublishedYear))
-					if yr < yearMin {
-						continue
-					}
-				}
-				filtered = append(filtered, b)
-			}
-			books = filtered
-		}
+		books := s.engine.ListBooks(domain.BookFilter{
+			Category: stringArg(args, "category"),
+			Tag:      stringArg(args, "tag"),
+			Author:   stringArg(args, "author"),
+			YearMin:  intArg(args, "year_min", 0),
+		})
 		if len(books) == 0 {
 			return "No matching books are currently indexed in Library MCP.", false
 		}
@@ -612,7 +595,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		if bookID == "" {
 			return "Error: 'book_id' parameter is required.", true
 		}
-		toc, err := s.engine.Store().GetBookTOC(bookID)
+		toc, err := s.engine.GetBookTOC(bookID)
 		if err != nil {
 			return fmt.Sprintf("Error retrieving TOC: %v", err), true
 		}
@@ -637,7 +620,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		if query == "" {
 			return "Error: 'query' parameter is required.", true
 		}
-		hits := s.engine.Store().SearchChapters(
+		hits := s.engine.SearchChapters(
 			query,
 			stringArg(args, "book_filter"),
 			stringArg(args, "category"),
@@ -661,7 +644,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 
 	case "get_chapter":
 		chapID := stringArg(args, "chapter_id")
-		chap, ok := s.engine.Store().GetChapter(chapID)
+		chap, ok := s.engine.GetChapter(chapID)
 		if !ok {
 			return fmt.Sprintf("Chapter %q not found.", chapID), true
 		}
@@ -701,7 +684,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 
 	case "deduplicate_books":
 		apply := boolArg(args, "apply")
-		rep, err := s.engine.Store().DeduplicateBooks(ctx, apply)
+		rep, err := s.engine.DeduplicateBooks(ctx, apply)
 		if err != nil {
 			return fmt.Sprintf("Deduplication failed: %v", err), true
 		}
@@ -736,7 +719,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 				}
 			}
 		}
-		saved, err := s.engine.Store().SaveNote(store.NoteRecord{
+		saved, err := s.engine.SaveNote(domain.NoteRecord{
 			Title:     stringArg(args, "title"),
 			Content:   content,
 			BookID:    stringArg(args, "book_id"),
@@ -751,7 +734,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 			saved.Title, saved.ID, saved.BookTitle, saved.ChapterTitle), false
 
 	case "list_notes":
-		notes := s.engine.Store().ListNotes(
+		notes := s.engine.ListNotes(
 			stringArg(args, "query"),
 			stringArg(args, "book_filter"),
 			stringArg(args, "tag"),
@@ -782,7 +765,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		if noteID == "" {
 			return "Error: 'note_id' parameter is required.", true
 		}
-		deleted, err := s.engine.Store().DeleteNote(noteID)
+		deleted, err := s.engine.DeleteNote(noteID)
 		if err != nil {
 			return fmt.Sprintf("Error deleting note: %v", err), true
 		}
@@ -817,7 +800,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 			if err != nil {
 				return fmt.Sprintf("Error enriching book %q: %v", bookID, err), true
 			}
-			return formatBooksList([]store.BookRecord{rec}), false
+			return formatBooksList([]domain.BookRecord{rec}), false
 		}
 		books, err := s.engine.EnrichAllBooks(ctx, force)
 		if err != nil {
@@ -830,7 +813,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		if target == "" {
 			return "Error: 'book_id' parameter is required.", true
 		}
-		removed, err := s.engine.Store().RemoveBook(ctx, target)
+		removed, err := s.engine.RemoveBook(ctx, target)
 		if err != nil {
 			return fmt.Sprintf("Error removing book: %v", err), true
 		}
@@ -842,7 +825,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 	}
 }
 
-func (s *Server) formatSearchResults(results []store.SearchResult) string {
+func (s *Server) formatSearchResults(results []domain.SearchResult) string {
 	var sb strings.Builder
 	for i, res := range results {
 		ck := res.Chunk
@@ -850,7 +833,7 @@ func (s *Server) formatSearchResults(results []store.SearchResult) string {
 		if parentContent == "" {
 			parentContent = ck.Text
 		}
-		bookRec, hasBook := s.engine.Store().GetBookRecord(ck.BookID)
+		bookRec, hasBook := s.engine.GetBookRecord(ck.BookID)
 		catTagLine := ""
 		if hasBook && (bookRec.Category != "" || len(bookRec.Tags) > 0) {
 			catTagLine = fmt.Sprintf("**Category:** %s | **Tags:** `%s`\n", bookRec.Category, strings.Join(bookRec.Tags, "`, `"))
@@ -870,7 +853,7 @@ func slugifyCategory(cat string) string {
 }
 
 func (s *Server) listResources() []map[string]any {
-	cats, _ := s.engine.Store().ListCategoriesAndTags()
+	cats, _ := s.engine.ListCategoriesAndTags()
 	res := []map[string]any{
 		{
 			"uri":         "library://catalog/overview",
@@ -906,12 +889,12 @@ func (s *Server) listResources() []map[string]any {
 func (s *Server) readResource(uri string) (string, string, error) {
 	switch uri {
 	case "library://catalog/overview":
-		bCount, chCount, pCount, ckCount, vCount := s.engine.Store().Stats()
-		cats, tags := s.engine.Store().ListCategoriesAndTags()
+		ov := s.engine.CatalogOverview()
+		cats, tags := ov.Categories, ov.Tags
 		var sb strings.Builder
 		sb.WriteString("# Library MCP Catalog Overview\n\n")
 		sb.WriteString(fmt.Sprintf("- **Indexed Books:** %d\n- **Chapters:** %d\n- **Parent Sections:** %d\n- **Child Chunks:** %d (%d dense vectors)\n",
-			bCount, chCount, pCount, ckCount, vCount))
+			ov.Books, ov.Chapters, ov.Parents, ov.Chunks, ov.Vectors))
 		sb.WriteString(fmt.Sprintf("- **Categories (%d):** %s\n", len(cats), strings.Join(cats, " | ")))
 		if len(tags) > 40 {
 			sb.WriteString(fmt.Sprintf("- **Sample Tags (%d total):** `%s`\n", len(tags), strings.Join(tags[:40], "`, `")))
@@ -931,10 +914,10 @@ func (s *Server) readResource(uri string) (string, string, error) {
 
 	if strings.HasPrefix(uri, "library://category/") {
 		wantSlug := strings.TrimPrefix(uri, "library://category/")
-		cats, _ := s.engine.Store().ListCategoriesAndTags()
+		cats, _ := s.engine.ListCategoriesAndTags()
 		for _, c := range cats {
 			if slugifyCategory(c) == wantSlug {
-				books := s.engine.Store().ListBooksFiltered(c, "")
+				books := s.engine.ListBooks(domain.BookFilter{Category: c})
 				return formatBooksList(books), "text/markdown", nil
 			}
 		}
@@ -1025,7 +1008,7 @@ func (s *Server) getPrompt(ctx context.Context, name string, args map[string]str
 		return "", nil, fmt.Errorf("prompt %q not found", name)
 	}
 
-	results := s.engine.SearchWithOptions(ctx, store.SearchOptions{
+	results := s.engine.SearchWithOptions(ctx, domain.SearchOptions{
 		Query:      topic,
 		Category:   category,
 		MaxPerBook: 1,
@@ -1073,7 +1056,7 @@ func boolArg(args map[string]any, key string) bool {
 	return b
 }
 
-func formatBooksList(books []store.BookRecord) string {
+func formatBooksList(books []domain.BookRecord) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Indexed Technical Books (%d):\n\n", len(books)))
 	for _, b := range books {

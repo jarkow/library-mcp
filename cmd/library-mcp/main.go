@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"library-mcp/internal/config"
+	"library-mcp/internal/domain"
 	"library-mcp/internal/mcp"
 	"library-mcp/internal/qdrant"
 	"library-mcp/internal/rag"
@@ -105,7 +106,7 @@ func main() {
 				os.Exit(1)
 			}
 			fmt.Println("Enriched Book Metadata:")
-			printBookRecords([]store.BookRecord{rec})
+			printBookRecords([]domain.BookRecord{rec})
 			return
 		}
 
@@ -137,7 +138,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		results := engine.SearchWithOptions(ctx, store.SearchOptions{
+		results := engine.SearchWithOptions(ctx, domain.SearchOptions{
 			Query:      query,
 			Mode:       *modeFlag,
 			BookFilter: *bookFlag,
@@ -172,7 +173,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Usage: library-mcp toc <book-id | title | isbn>")
 			os.Exit(1)
 		}
-		toc, err := st.GetBookTOC(target)
+		toc, err := engine.GetBookTOC(target)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -201,7 +202,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Usage: library-mcp chapters [--book <filter>] [--category <cat>] [--tag <tag>] <query>")
 			os.Exit(1)
 		}
-		hits := st.SearchChapters(query, *bookFlag, *catFlag, *tagFlag, *topKFlag)
+		hits := engine.SearchChapters(query, *bookFlag, *catFlag, *tagFlag, *topKFlag)
 		if len(hits) == 0 {
 			fmt.Println("No matching chapters found.")
 			return
@@ -256,7 +257,7 @@ func main() {
 		applyFlag := fs.Bool("apply", false, "Remove duplicate editions and keep the highest-quality copy of each book")
 		_ = fs.Parse(args)
 
-		rep, err := st.DeduplicateBooks(ctx, *applyFlag)
+		rep, err := engine.DeduplicateBooks(ctx, *applyFlag)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Deduplication failed: %v\n", err)
 			os.Exit(1)
@@ -305,7 +306,7 @@ func main() {
 					tags = append(tags, strings.TrimSpace(t))
 				}
 			}
-			saved, err := st.SaveNote(store.NoteRecord{
+			saved, err := engine.SaveNote(domain.NoteRecord{
 				Title:     *titleFlag,
 				Content:   content,
 				BookID:    *bookFlag,
@@ -324,7 +325,7 @@ func main() {
 				fmt.Fprintln(os.Stderr, "Usage: library-mcp notes remove <note-id>")
 				os.Exit(1)
 			}
-			deleted, err := st.DeleteNote(subArgs[0])
+			deleted, err := engine.DeleteNote(subArgs[0])
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error deleting note: %v\n", err)
 				os.Exit(1)
@@ -337,7 +338,7 @@ func main() {
 			tagFlag := fs.String("tag", "", "Filter by tag")
 			_ = fs.Parse(subArgs)
 			query := strings.TrimSpace(strings.Join(fs.Args(), " "))
-			notes := st.ListNotes(query, *bookFlag, *tagFlag)
+			notes := engine.ListNotes(query, *bookFlag, *tagFlag)
 			if len(notes) == 0 {
 				fmt.Println("No saved notes found.")
 				return
@@ -409,9 +410,11 @@ func main() {
 		fs := flag.NewFlagSet("books", flag.ExitOnError)
 		catFlag := fs.String("category", "", "Filter books by category")
 		tagFlag := fs.String("tag", "", "Filter books by tag")
+		authorFlag := fs.String("author", "", "Filter books by author substring")
+		yearMinFlag := fs.Int("year-min", 0, "Filter books by minimum published year")
 		_ = fs.Parse(args)
 
-		books := st.ListBooksFiltered(*catFlag, *tagFlag)
+		books := engine.ListBooks(domain.BookFilter{Category: *catFlag, Tag: *tagFlag, Author: *authorFlag, YearMin: *yearMinFlag})
 		if len(books) == 0 {
 			fmt.Println("No matching books indexed yet. Run: library-mcp ingest")
 			return
@@ -425,11 +428,12 @@ func main() {
 		_ = fs.Parse(args)
 
 		if *allFlag {
-			books := st.ListBooks()
-			for _, b := range books {
-				_, _ = st.RemoveBook(ctx, b.ID)
+			n, err := engine.RemoveAllBooks(ctx)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error removing books (removed %d): %v\n", n, err)
+				os.Exit(1)
 			}
-			fmt.Printf("Removed all %d books from the catalog.\n", len(books))
+			fmt.Printf("Removed all %d books from the catalog.\n", n)
 			return
 		}
 
@@ -438,7 +442,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Usage: library-mcp remove <book-id | title | isbn | filename> [--all]")
 			os.Exit(1)
 		}
-		removed, err := st.RemoveBook(ctx, target)
+		removed, err := engine.RemoveBook(ctx, target)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error removing book: %v\n", err)
 			os.Exit(1)
@@ -447,8 +451,9 @@ func main() {
 			removed.ID, removed.Title, removed.Author, removed.ChapterCount, removed.ParentCount, removed.ChunkCount)
 
 	case "status":
-		bCount, chCount, pCount, ckCount, vCount := st.Stats()
-		cats, tags := st.ListCategoriesAndTags()
+		ov := engine.CatalogOverview()
+		bCount, chCount, pCount, ckCount, vCount := ov.Books, ov.Chapters, ov.Parents, ov.Chunks, ov.Vectors
+		cats, tags := ov.Categories, ov.Tags
 		qdrantOK := engine.CheckQdrant(ctx)
 		models, ollamaErr := engine.ListOllamaModels(ctx)
 		fmt.Println("Library MCP Status:")
@@ -461,15 +466,15 @@ func main() {
 		fmt.Printf("  Catalog Totals       : %d books, %d chapters, %d parent sections, %d child chunks (%d vectors)\n",
 			bCount, chCount, pCount, ckCount, vCount)
 		fmt.Printf("  Taxonomy             : %d categories, %d unique tags\n", len(cats), len(tags))
-		fmt.Printf("  Saved Notes          : %d notes | Duplicate Groups: %d\n", len(st.ListNotes("", "", "")), len(st.FindDuplicates()))
+		fmt.Printf("  Saved Notes          : %d notes | Duplicate Groups: %d\n", ov.NotesCount, ov.DuplicatesCount)
 
 	case "sync":
 		fmt.Printf("Syncing local catalog chunks to Qdrant (%s, collection: %s)...\n", cfg.QdrantURL, cfg.QdrantCollection)
-		if err := st.SyncAllToQdrant(ctx); err != nil {
+		if err := engine.SyncToQdrant(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "Qdrant sync failed: %v\n", err)
 			os.Exit(1)
 		}
-		_, _, _, ckCount, _ := st.Stats()
+		ckCount := engine.CatalogOverview().Chunks
 		fmt.Printf("Successfully synced %d child chunks to Qdrant.\n", ckCount)
 		fmt.Printf("Inspect collection in Qdrant Dashboard: %s/dashboard#/collections/%s\n", cfg.QdrantURL, cfg.QdrantCollection)
 
@@ -546,7 +551,7 @@ func main() {
 	}
 }
 
-func printBookRecords(books []store.BookRecord) {
+func printBookRecords(books []domain.BookRecord) {
 	for _, b := range books {
 		title := b.Title
 		if b.Subtitle != "" {
