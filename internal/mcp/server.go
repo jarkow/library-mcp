@@ -557,7 +557,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 	case "search_books":
 		query, _ := args["query"].(string)
 		if strings.TrimSpace(query) == "" {
-			return "Error: 'query' parameter is required.", true
+			return toJSONError("'query' parameter is required.")
 		}
 		opts := domain.SearchOptions{
 			Query:      query,
@@ -573,10 +573,12 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		}
 
 		results := s.engine.SearchWithOptions(ctx, opts)
-		if len(results) == 0 {
-			return "No matching passages found in the library.", false
-		}
-		return s.formatSearchResults(results), false
+		items := s.toMCPSearchResults(results)
+		return toJSON(map[string]any{
+			"query":   query,
+			"count":   len(items),
+			"results": items,
+		})
 
 	case "list_books":
 		books := s.engine.ListBooks(domain.BookFilter{
@@ -585,40 +587,36 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 			Author:   stringArg(args, "author"),
 			YearMin:  intArg(args, "year_min", 0),
 		})
-		if len(books) == 0 {
-			return "No matching books are currently indexed in Library MCP.", false
-		}
-		return formatBooksList(books), false
+		items := toMCPBookItems(books)
+		return toJSON(map[string]any{
+			"count": len(items),
+			"books": items,
+		})
 
 	case "get_book_toc":
 		bookID := stringArg(args, "book_id")
 		if bookID == "" {
-			return "Error: 'book_id' parameter is required.", true
+			return toJSONError("'book_id' parameter is required.")
 		}
 		toc, err := s.engine.GetBookTOC(bookID)
 		if err != nil {
-			return fmt.Sprintf("Error retrieving TOC: %v", err), true
+			return toJSONError(fmt.Sprintf("Error retrieving TOC: %v", err))
 		}
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("# Table of Contents: %s\n", toc.Book.Title))
-		sb.WriteString(fmt.Sprintf("- **Author:** %s | **Book ID:** `%s` | **Category:** %s\n", toc.Book.Author, toc.Book.ID, toc.Book.Category))
-		sb.WriteString(fmt.Sprintf("- **Chapters:** %d | **Parent Sections:** %d | **Child Chunks:** %d\n\n",
-			toc.Book.ChapterCount, toc.Book.ParentCount, toc.Book.ChunkCount))
-
-		for _, ch := range toc.Chapters {
-			sb.WriteString(fmt.Sprintf("## %d. %s (`chapter_id`: `%s`, %d chars)\n", ch.ChapterIndex, ch.Title, ch.ChapterID, ch.CharLength))
-			for _, sec := range ch.Sections {
-				if sec.Title != "" && !strings.EqualFold(sec.Title, ch.Title) {
-					sb.WriteString(fmt.Sprintf("  - %s (`parent_id`: `%s`, %d chars)\n", sec.Title, sec.ParentID, sec.CharLength))
-				}
-			}
+		if toc.Book.Tags == nil {
+			toc.Book.Tags = []string{}
 		}
-		return sb.String(), false
+		if toc.Book.Subjects == nil {
+			toc.Book.Subjects = []string{}
+		}
+		if toc.Chapters == nil {
+			toc.Chapters = []domain.TOCChapter{}
+		}
+		return toJSON(toc)
 
 	case "search_chapters":
 		query := stringArg(args, "query")
 		if query == "" {
-			return "Error: 'query' parameter is required.", true
+			return toJSONError("'query' parameter is required.")
 		}
 		hits := s.engine.SearchChapters(
 			query,
@@ -627,89 +625,91 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 			stringArg(args, "tag"),
 			intArg(args, "top_k", 15),
 		)
-		if len(hits) == 0 {
-			return "No matching chapters or section headings found.", false
+		if hits == nil {
+			hits = []domain.ChapterSearchHit{}
 		}
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("# Matching Chapters & Sections (%d)\n\n", len(hits)))
-		for i, h := range hits {
-			sb.WriteString(fmt.Sprintf("%d. **%s** (%s) — **%s > %s**\n", i+1, h.BookTitle, h.Author, h.ChapterTitle, h.SectionTitle))
-			sb.WriteString(fmt.Sprintf("   - `chapter_id`: `%s` | `parent_id`: `%s` | Category: %s | Score: `%.1f`\n",
-				h.ChapterID, h.ParentID, h.Category, h.Score))
-			if h.Snippet != "" {
-				sb.WriteString(fmt.Sprintf("   - *Preview:* %s\n", h.Snippet))
-			}
-		}
-		return sb.String(), false
+		return toJSON(map[string]any{
+			"query":    query,
+			"count":    len(hits),
+			"chapters": hits,
+		})
 
 	case "get_chapter":
 		chapID := stringArg(args, "chapter_id")
+		if chapID == "" {
+			return toJSONError("'chapter_id' parameter is required.")
+		}
 		chap, ok := s.engine.GetChapter(chapID)
 		if !ok {
-			return fmt.Sprintf("Chapter %q not found.", chapID), true
+			return toJSONError(fmt.Sprintf("Chapter %q not found.", chapID))
 		}
-		return fmt.Sprintf("# %s (Chapter ID: %s)\n\n%s", chap.Title, chap.ID, chap.Content), false
+		return toJSON(map[string]any{
+			"chapter_id":    chap.ID,
+			"book_id":       chap.BookID,
+			"chapter_index": chap.ChapterIndex,
+			"title":         chap.Title,
+			"href":          chap.Href,
+			"char_length":   len(chap.Content),
+			"content":       chap.Content,
+		})
 
 	case "compare_books_on_topic":
 		topic := stringArg(args, "topic")
 		if topic == "" {
-			return "Error: 'topic' parameter is required.", true
+			return toJSONError("'topic' parameter is required.")
 		}
-		_, markdown := s.engine.CompareBooksOnTopic(
+		results, markdown := s.engine.CompareBooksOnTopic(
 			ctx,
 			topic,
 			stringArg(args, "category"),
 			stringArg(args, "tag"),
 			intArg(args, "max_books", 5),
 		)
-		return markdown, false
+		items := s.toMCPSearchResults(results)
+		return toJSON(map[string]any{
+			"topic":            topic,
+			"books_compared":   len(items),
+			"perspectives":     items,
+			"markdown_summary": markdown,
+		})
 
 	case "extract_code_examples":
 		query := stringArg(args, "query")
 		if query == "" {
-			return "Error: 'query' parameter is required.", true
+			return toJSONError("'query' parameter is required.")
 		}
+		lang := stringArg(args, "language")
 		results := s.engine.ExtractCodeExamples(
 			ctx,
 			query,
-			stringArg(args, "language"),
+			lang,
 			stringArg(args, "book_filter"),
 			stringArg(args, "category"),
 			intArg(args, "top_k", 5),
 		)
-		if len(results) == 0 {
-			return "No code-heavy sections matched your query.", false
-		}
-		return s.formatSearchResults(results), false
+		items := s.toMCPSearchResults(results)
+		return toJSON(map[string]any{
+			"query":    query,
+			"language": lang,
+			"count":    len(items),
+			"results":  items,
+		})
 
 	case "deduplicate_books":
 		apply := boolArg(args, "apply")
 		rep, err := s.engine.DeduplicateBooks(ctx, apply)
 		if err != nil {
-			return fmt.Sprintf("Deduplication failed: %v", err), true
+			return toJSONError(fmt.Sprintf("Deduplication failed: %v", err))
 		}
-		if len(rep.Groups) == 0 {
-			return "No duplicate books detected in the catalog.", false
+		if rep.Groups == nil {
+			rep.Groups = []domain.DuplicateGroup{}
 		}
-		var sb strings.Builder
-		if apply {
-			sb.WriteString(fmt.Sprintf("# Deduplication Applied: Removed %d Duplicate Books (%d chunks freed)\n\n", len(rep.RemovedBooks), rep.FreedChunks))
-		} else {
-			sb.WriteString(fmt.Sprintf("# Duplicate Books Analysis (Dry Run): %d Duplicate Groups (%d chunks can be freed)\n*Call `deduplicate_books` with `apply: true` to remove duplicates.*\n\n", len(rep.Groups), rep.FreedChunks))
-		}
-		for i, g := range rep.Groups {
-			sb.WriteString(fmt.Sprintf("%d. **%s** by %s — *%s*\n", i+1, g.Keep.Title, g.Keep.Author, g.Reason))
-			sb.WriteString(fmt.Sprintf("   - **Keep:** `[%s]` `%s` (%d chunks)\n", g.Keep.ID, g.Keep.FileName, g.Keep.ChunkCount))
-			for _, d := range g.Duplicates {
-				sb.WriteString(fmt.Sprintf("   - **Duplicate:** `[%s]` `%s` (%d chunks)\n", d.ID, d.FileName, d.ChunkCount))
-			}
-		}
-		return sb.String(), false
+		return toJSON(rep)
 
 	case "save_note":
 		content := stringArg(args, "content")
 		if content == "" {
-			return "Error: 'content' parameter is required.", true
+			return toJSONError("'content' parameter is required.")
 		}
 		var tags []string
 		if rawTags, ok := args["tags"].([]any); ok {
@@ -728,10 +728,15 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 			Tags:      tags,
 		})
 		if err != nil {
-			return fmt.Sprintf("Error saving note: %v", err), true
+			return toJSONError(fmt.Sprintf("Error saving note: %v", err))
 		}
-		return fmt.Sprintf("Saved note **%s** (`id`: `%s`, linked book: `%s`, chapter: `%s`).",
-			saved.Title, saved.ID, saved.BookTitle, saved.ChapterTitle), false
+		if saved.Tags == nil {
+			saved.Tags = []string{}
+		}
+		return toJSON(map[string]any{
+			"status": "saved",
+			"note":   saved,
+		})
 
 	case "list_notes":
 		notes := s.engine.ListNotes(
@@ -739,42 +744,32 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 			stringArg(args, "book_filter"),
 			stringArg(args, "tag"),
 		)
-		if len(notes) == 0 {
-			return "No saved notes found.", false
+		if notes == nil {
+			notes = []domain.NoteRecord{}
 		}
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("# Saved Library Notes (%d)\n\n", len(notes)))
-		for _, n := range notes {
-			sb.WriteString(fmt.Sprintf("## %s (`id`: `%s`)\n", n.Title, n.ID))
-			if n.BookTitle != "" {
-				sb.WriteString(fmt.Sprintf("- **Book:** %s (`%s`)", n.BookTitle, n.BookID))
-				if n.ChapterTitle != "" {
-					sb.WriteString(fmt.Sprintf(" | **Chapter:** %s (`%s`)", n.ChapterTitle, n.ChapterID))
-				}
-				sb.WriteString("\n")
-			}
-			if len(n.Tags) > 0 {
-				sb.WriteString(fmt.Sprintf("- **Tags:** `%s`\n", strings.Join(n.Tags, "`, `")))
-			}
-			sb.WriteString(fmt.Sprintf("- **Updated:** %s\n\n%s\n\n---\n\n", n.UpdatedAt, n.Content))
-		}
-		return sb.String(), false
+		return toJSON(map[string]any{
+			"count": len(notes),
+			"notes": notes,
+		})
 
 	case "delete_note":
 		noteID := stringArg(args, "note_id")
 		if noteID == "" {
-			return "Error: 'note_id' parameter is required.", true
+			return toJSONError("'note_id' parameter is required.")
 		}
 		deleted, err := s.engine.DeleteNote(noteID)
 		if err != nil {
-			return fmt.Sprintf("Error deleting note: %v", err), true
+			return toJSONError(fmt.Sprintf("Error deleting note: %v", err))
 		}
-		return fmt.Sprintf("Deleted note **%s** (`%s`).", deleted.Title, deleted.ID), false
+		return toJSON(map[string]any{
+			"status": "deleted",
+			"note":   deleted,
+		})
 
 	case "export_dossier":
 		topic := stringArg(args, "topic")
 		if topic == "" {
-			return "Error: 'topic' parameter is required.", true
+			return toJSONError("'topic' parameter is required.")
 		}
 		md, savedPath, err := s.engine.ExportTopicDossier(
 			ctx,
@@ -785,12 +780,13 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 			intArg(args, "top_k", 6),
 		)
 		if err != nil {
-			return fmt.Sprintf("Error exporting dossier: %v", err), true
+			return toJSONError(fmt.Sprintf("Error exporting dossier: %v", err))
 		}
-		if savedPath != "" {
-			return fmt.Sprintf("Dossier saved to `%s`.\n\n%s", savedPath, md), false
-		}
-		return md, false
+		return toJSON(map[string]any{
+			"topic":      topic,
+			"saved_path": savedPath,
+			"markdown":   md,
+		})
 
 	case "enrich_books":
 		bookID := stringArg(args, "book_id")
@@ -798,30 +794,40 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		if bookID != "" {
 			rec, err := s.engine.EnrichBook(ctx, bookID)
 			if err != nil {
-				return fmt.Sprintf("Error enriching book %q: %v", bookID, err), true
+				return toJSONError(fmt.Sprintf("Error enriching book %q: %v", bookID, err))
 			}
-			return formatBooksList([]domain.BookRecord{rec}), false
+			items := toMCPBookItems([]domain.BookRecord{rec})
+			return toJSON(map[string]any{
+				"count": len(items),
+				"books": items,
+			})
 		}
 		books, err := s.engine.EnrichAllBooks(ctx, force)
 		if err != nil {
-			return fmt.Sprintf("Error enriching books: %v", err), true
+			return toJSONError(fmt.Sprintf("Error enriching books: %v", err))
 		}
-		return formatBooksList(books), false
+		items := toMCPBookItems(books)
+		return toJSON(map[string]any{
+			"count": len(items),
+			"books": items,
+		})
 
 	case "remove_book":
 		target := stringArg(args, "book_id")
 		if target == "" {
-			return "Error: 'book_id' parameter is required.", true
+			return toJSONError("'book_id' parameter is required.")
 		}
 		removed, err := s.engine.RemoveBook(ctx, target)
 		if err != nil {
-			return fmt.Sprintf("Error removing book: %v", err), true
+			return toJSONError(fmt.Sprintf("Error removing book: %v", err))
 		}
-		return fmt.Sprintf("Removed book **%s** by %s (`id`: `%s`, %d chapters, %d parent sections, %d child chunks).",
-			removed.Title, removed.Author, removed.ID, removed.ChapterCount, removed.ParentCount, removed.ChunkCount), false
+		return toJSON(map[string]any{
+			"status": "removed",
+			"book":   toMCPBookItem(removed),
+		})
 
 	default:
-		return fmt.Sprintf("Unknown tool: %s", name), true
+		return toJSONError(fmt.Sprintf("Unknown tool: %s", name))
 	}
 }
 
@@ -859,19 +865,19 @@ func (s *Server) listResources() []map[string]any {
 			"uri":         "library://catalog/overview",
 			"name":        "Library Catalog Overview & Taxonomy",
 			"description": "Summary statistics, categories, and tags across all indexed technical books.",
-			"mimeType":    "text/markdown",
+			"mimeType":    "application/json",
 		},
 		{
 			"uri":         "library://catalog/notes",
 			"name":        "Saved Library Notes & Bookmarks",
 			"description": "All saved annotations, highlights, and architectural notes linked to books and chapters.",
-			"mimeType":    "text/markdown",
+			"mimeType":    "application/json",
 		},
 		{
 			"uri":         "library://catalog/duplicates",
 			"name":        "Duplicate Books Report",
 			"description": "Analysis of duplicate book editions detected across the library.",
-			"mimeType":    "text/markdown",
+			"mimeType":    "application/json",
 		},
 	}
 	for _, c := range cats {
@@ -880,7 +886,7 @@ func (s *Server) listResources() []map[string]any {
 			"uri":         "library://category/" + slug,
 			"name":        "Category: " + c,
 			"description": fmt.Sprintf("All indexed books in category %q", c),
-			"mimeType":    "text/markdown",
+			"mimeType":    "application/json",
 		})
 	}
 	return res
@@ -890,26 +896,22 @@ func (s *Server) readResource(uri string) (string, string, error) {
 	switch uri {
 	case "library://catalog/overview":
 		ov := s.engine.CatalogOverview()
-		cats, tags := ov.Categories, ov.Tags
-		var sb strings.Builder
-		sb.WriteString("# Library MCP Catalog Overview\n\n")
-		sb.WriteString(fmt.Sprintf("- **Indexed Books:** %d\n- **Chapters:** %d\n- **Parent Sections:** %d\n- **Child Chunks:** %d (%d dense vectors)\n",
-			ov.Books, ov.Chapters, ov.Parents, ov.Chunks, ov.Vectors))
-		sb.WriteString(fmt.Sprintf("- **Categories (%d):** %s\n", len(cats), strings.Join(cats, " | ")))
-		if len(tags) > 40 {
-			sb.WriteString(fmt.Sprintf("- **Sample Tags (%d total):** `%s`\n", len(tags), strings.Join(tags[:40], "`, `")))
-		} else if len(tags) > 0 {
-			sb.WriteString(fmt.Sprintf("- **Tags (%d):** `%s`\n", len(tags), strings.Join(tags, "`, `")))
+		if ov.Categories == nil {
+			ov.Categories = []string{}
 		}
-		return sb.String(), "text/markdown", nil
+		if ov.Tags == nil {
+			ov.Tags = []string{}
+		}
+		out, _ := toJSON(ov)
+		return out, "application/json", nil
 
 	case "library://catalog/notes":
 		out, _ := s.executeTool(context.Background(), "list_notes", nil)
-		return out, "text/markdown", nil
+		return out, "application/json", nil
 
 	case "library://catalog/duplicates":
 		out, _ := s.executeTool(context.Background(), "deduplicate_books", map[string]any{"apply": false})
-		return out, "text/markdown", nil
+		return out, "application/json", nil
 	}
 
 	if strings.HasPrefix(uri, "library://category/") {
@@ -918,7 +920,13 @@ func (s *Server) readResource(uri string) (string, string, error) {
 		for _, c := range cats {
 			if slugifyCategory(c) == wantSlug {
 				books := s.engine.ListBooks(domain.BookFilter{Category: c})
-				return formatBooksList(books), "text/markdown", nil
+				items := toMCPBookItems(books)
+				out, _ := toJSON(map[string]any{
+					"category": c,
+					"count":    len(items),
+					"books":    items,
+				})
+				return out, "application/json", nil
 			}
 		}
 	}
@@ -1056,45 +1064,141 @@ func boolArg(args map[string]any, key string) bool {
 	return b
 }
 
-func formatBooksList(books []domain.BookRecord) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Indexed Technical Books (%d):\n\n", len(books)))
-	for _, b := range books {
-		titleLine := fmt.Sprintf("- **%s**", b.Title)
-		if b.Subtitle != "" {
-			titleLine += fmt.Sprintf(": *%s*", b.Subtitle)
-		}
-		titleLine += fmt.Sprintf(" by %s (`id`: `%s`)\n", b.Author, b.ID)
-		sb.WriteString(titleLine)
+type mcpBookItem struct {
+	ID             string   `json:"id"`
+	Title          string   `json:"title"`
+	Subtitle       string   `json:"subtitle,omitempty"`
+	Author         string   `json:"author"`
+	Category       string   `json:"category"`
+	Tags           []string `json:"tags"`
+	Publisher      string   `json:"publisher,omitempty"`
+	PublishedYear  string   `json:"published_year,omitempty"`
+	ISBN           string   `json:"isbn,omitempty"`
+	PageCount      int      `json:"page_count,omitempty"`
+	Language       string   `json:"language,omitempty"`
+	Format         string   `json:"format,omitempty"`
+	FileName       string   `json:"file_name,omitempty"`
+	MetadataSource string   `json:"metadata_source,omitempty"`
+	WebURL         string   `json:"web_url,omitempty"`
+	ChapterCount   int      `json:"chapter_count"`
+	ParentCount    int      `json:"parent_count"`
+	ChunkCount     int      `json:"chunk_count"`
+	IndexedAt      string   `json:"indexed_at,omitempty"`
+}
 
-		category := b.Category
-		if category == "" {
-			category = "Uncategorized"
-		}
-		tagsStr := "none"
-		if len(b.Tags) > 0 {
-			tagsStr = "`" + strings.Join(b.Tags, "`, `") + "`"
-		}
-		sb.WriteString(fmt.Sprintf("  - **Category:** %s | **Tags:** %s\n", category, tagsStr))
+type mcpSearchResult struct {
+	Rank         int      `json:"rank"`
+	Score        float64  `json:"score"`
+	BM25Score    float64  `json:"bm25_score,omitempty"`
+	VectorScore  float64  `json:"vector_score,omitempty"`
+	ChildHits    int      `json:"child_hits"`
+	MatchSources []string `json:"match_sources"`
+	BookID       string   `json:"book_id"`
+	BookTitle    string   `json:"book_title"`
+	Author       string   `json:"author"`
+	Category     string   `json:"category,omitempty"`
+	Tags         []string `json:"tags"`
+	ChapterID    string   `json:"chapter_id"`
+	ChapterTitle string   `json:"chapter_title"`
+	ParentID     string   `json:"parent_id"`
+	SectionTitle string   `json:"section_title"`
+	HasCode      bool     `json:"has_code"`
+	Content      string   `json:"content"`
+}
 
-		var bibParts []string
-		if b.Publisher != "" {
-			bibParts = append(bibParts, "Publisher: "+b.Publisher)
-		}
-		if b.PublishedYear != "" {
-			bibParts = append(bibParts, "Year: "+b.PublishedYear)
-		}
-		if b.ISBN != "" {
-			bibParts = append(bibParts, "ISBN: "+b.ISBN)
-		}
-		if b.MetadataSource != "" {
-			bibParts = append(bibParts, "Source: "+b.MetadataSource)
-		}
-		if len(bibParts) > 0 {
-			sb.WriteString(fmt.Sprintf("  - **Metadata:** %s\n", strings.Join(bibParts, " | ")))
-		}
-		sb.WriteString(fmt.Sprintf("  - **Structure:** %d chapters, %d parent sections, %d child chunks\n",
-			b.ChapterCount, b.ParentCount, b.ChunkCount))
+func toJSON(v any) (string, bool) {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return toJSONError(fmt.Sprintf("failed to serialize JSON response: %v", err))
 	}
-	return sb.String()
+	return string(b), false
+}
+
+func toJSONError(msg string) (string, bool) {
+	b, err := json.MarshalIndent(map[string]string{"error": msg}, "", "  ")
+	if err != nil {
+		return fmt.Sprintf(`{"error": %q}`, msg), true
+	}
+	return string(b), true
+}
+
+func toMCPBookItem(b domain.BookRecord) mcpBookItem {
+	category := b.Category
+	if category == "" {
+		category = "Uncategorized"
+	}
+	tags := make([]string, len(b.Tags))
+	copy(tags, b.Tags)
+	return mcpBookItem{
+		ID:             b.ID,
+		Title:          b.Title,
+		Subtitle:       b.Subtitle,
+		Author:         b.Author,
+		Category:       category,
+		Tags:           tags,
+		Publisher:      b.Publisher,
+		PublishedYear:  b.PublishedYear,
+		ISBN:           b.ISBN,
+		PageCount:      b.PageCount,
+		Language:       b.Language,
+		Format:         b.Format,
+		FileName:       b.FileName,
+		MetadataSource: b.MetadataSource,
+		WebURL:         b.WebURL,
+		ChapterCount:   b.ChapterCount,
+		ParentCount:    b.ParentCount,
+		ChunkCount:     b.ChunkCount,
+		IndexedAt:      b.IndexedAt,
+	}
+}
+
+func toMCPBookItems(books []domain.BookRecord) []mcpBookItem {
+	items := make([]mcpBookItem, 0, len(books))
+	for _, b := range books {
+		items = append(items, toMCPBookItem(b))
+	}
+	return items
+}
+
+func (s *Server) toMCPSearchResults(results []domain.SearchResult) []mcpSearchResult {
+	items := make([]mcpSearchResult, 0, len(results))
+	for i, res := range results {
+		ck := res.Chunk
+		parentContent := res.ParentText
+		if parentContent == "" {
+			parentContent = ck.Text
+		}
+		var category string
+		tags := []string{}
+		if bookRec, hasBook := s.engine.GetBookRecord(ck.BookID); hasBook {
+			category = bookRec.Category
+			if len(bookRec.Tags) > 0 {
+				tags = append([]string(nil), bookRec.Tags...)
+			}
+		}
+		sources := []string{}
+		if len(res.MatchSources) > 0 {
+			sources = append([]string(nil), res.MatchSources...)
+		}
+		items = append(items, mcpSearchResult{
+			Rank:         i + 1,
+			Score:        res.Score,
+			BM25Score:    res.BM25Score,
+			VectorScore:  res.VectorScore,
+			ChildHits:    res.ChildHits,
+			MatchSources: sources,
+			BookID:       ck.BookID,
+			BookTitle:    ck.BookTitle,
+			Author:       ck.Author,
+			Category:     category,
+			Tags:         tags,
+			ChapterID:    ck.ChapterID,
+			ChapterTitle: ck.ChapterTitle,
+			ParentID:     res.ParentID,
+			SectionTitle: ck.SectionTitle,
+			HasCode:      ck.HasCode,
+			Content:      parentContent,
+		})
+	}
+	return items
 }
