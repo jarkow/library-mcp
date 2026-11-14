@@ -8,8 +8,13 @@ import (
 	"hash/fnv"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -30,6 +35,11 @@ type Client struct {
 	BaseURL    string
 	Collection string
 	HTTPClient *http.Client
+
+	mu               sync.Mutex
+	autoStart        bool
+	composeDirs      []string
+	lastStartAttempt time.Time
 }
 
 // NewClient initializes a Qdrant client for the given baseURL and collection name.
@@ -41,6 +51,151 @@ func NewClient(baseURL, collection string) *Client {
 			Timeout: 60 * time.Second,
 		},
 	}
+}
+
+// EnableAutoStart enables automatic startup of the local Qdrant Docker container
+// using docker-compose.yml searched in dirs (as well as executable and working directories).
+func (c *Client) EnableAutoStart(dirs ...string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.autoStart = true
+	seen := make(map[string]bool)
+	var deduped []string
+	for _, d := range dirs {
+		cleaned := strings.TrimSpace(d)
+		if cleaned == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(cleaned); err == nil {
+			cleaned = abs
+		}
+		if !seen[cleaned] {
+			seen[cleaned] = true
+			deduped = append(deduped, cleaned)
+		}
+	}
+	c.composeDirs = deduped
+}
+
+// CopyAutoStartFrom copies the auto-start flag and candidate compose directories from other.
+func (c *Client) CopyAutoStartFrom(other *Client) {
+	if c == nil || other == nil || c == other {
+		return
+	}
+	other.mu.Lock()
+	enabled := other.autoStart
+	dirs := append([]string(nil), other.composeDirs...)
+	other.mu.Unlock()
+
+	c.mu.Lock()
+	c.autoStart = enabled
+	c.composeDirs = dirs
+	c.mu.Unlock()
+}
+
+// EnsureContainerRunning checks whether Qdrant is reachable and, if it is a local
+// endpoint that is down, starts the Docker container via docker-compose.yml or container name.
+// All command output is captured in memory so stdout (used by MCP stdio) is never polluted.
+func (c *Client) EnsureContainerRunning(ctx context.Context) error {
+	hcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	err := c.HealthCheck(hcCtx)
+	cancel()
+	if err == nil {
+		return nil
+	}
+	if !isLocalEndpoint(c.BaseURL) {
+		return err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	hcCtx2, cancel2 := context.WithTimeout(ctx, 1*time.Second)
+	err2 := c.HealthCheck(hcCtx2)
+	cancel2()
+	if err2 == nil {
+		return nil
+	}
+
+	if !c.lastStartAttempt.IsZero() && time.Since(c.lastStartAttempt) < 30*time.Second {
+		return fmt.Errorf("qdrant offline (auto-start cooldown active): %w", err2)
+	}
+	c.lastStartAttempt = time.Now()
+
+	var startErr error
+	if composePath := c.findComposeFile(); composePath != "" {
+		startErr = runDockerCommand(ctx, 15*time.Second, filepath.Dir(composePath), "compose", "-f", composePath, "up", "-d")
+	} else {
+		startErr = fmt.Errorf("docker-compose.yml not found")
+	}
+	if startErr != nil {
+		if fallbackErr := runDockerCommand(ctx, 10*time.Second, "", "start", "library-mcp-qdrant"); fallbackErr != nil {
+			return fmt.Errorf("failed to start qdrant container (%v; fallback: %v)", startErr, fallbackErr)
+		}
+	}
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		pollCtx, pollCancel := context.WithTimeout(ctx, 1*time.Second)
+		pollErr := c.HealthCheck(pollCtx)
+		pollCancel()
+		if pollErr == nil {
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("qdrant container started but did not pass /healthz within 8s")
+}
+
+func isLocalEndpoint(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
+func (c *Client) findComposeFile() string {
+	candidates := make([]string, 0, len(c.composeDirs)+2)
+	candidates = append(candidates, c.composeDirs...)
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Dir(exe))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, cwd)
+	}
+	for _, dir := range candidates {
+		if dir == "" {
+			continue
+		}
+		p := filepath.Join(dir, "docker-compose.yml")
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+func runDockerCommand(parentCtx context.Context, timeout time.Duration, workDir string, args ...string) error {
+	cmdCtx, cancel := context.WithTimeout(parentCtx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, "docker", args...)
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
 }
 
 // HealthCheck checks whether the Qdrant server is reachable and healthy.
@@ -107,6 +262,8 @@ func (c *Client) EnsureCollection(ctx context.Context, denseDim int) error {
 		{"parent_id", "keyword"},
 		{"chapter_id", "keyword"},
 		{"book_title", "text"},
+		{"author", "text"},
+		{"has_code", "bool"},
 	}
 	indexURL := fmt.Sprintf("%s/collections/%s/index?wait=true", c.BaseURL, c.Collection)
 	for _, idx := range indexFields {
@@ -276,6 +433,13 @@ func (c *Client) QueryHybrid(
 		reqBody["filter"] = filterObj
 	}
 
+	c.mu.Lock()
+	autoStart := c.autoStart
+	c.mu.Unlock()
+	if autoStart {
+		_ = c.EnsureContainerRunning(ctx)
+	}
+
 	queryURL := fmt.Sprintf("%s/collections/%s/points/query", c.BaseURL, c.Collection)
 	var rawResp struct {
 		Result struct {
@@ -283,6 +447,11 @@ func (c *Client) QueryHybrid(
 		} `json:"result"`
 	}
 	if err := c.doJSON(ctx, http.MethodPost, queryURL, reqBody, &rawResp); err != nil {
+		if autoStart && c.EnsureContainerRunning(ctx) == nil {
+			if retryErr := c.doJSON(ctx, http.MethodPost, queryURL, reqBody, &rawResp); retryErr == nil {
+				return rawResp.Result.Points, nil
+			}
+		}
 		return nil, err
 	}
 	return rawResp.Result.Points, nil
@@ -292,6 +461,28 @@ func buildBookFilter(bookFilter string) map[string]any {
 	f := strings.TrimSpace(bookFilter)
 	if f == "" {
 		return nil
+	}
+	if strings.HasPrefix(f, "book_ids:") {
+		raw := strings.TrimPrefix(f, "book_ids:")
+		var ids []string
+		for _, part := range strings.Split(raw, ",") {
+			if id := strings.TrimSpace(part); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		return map[string]any{
+			"must": []map[string]any{
+				{
+					"key": "book_id",
+					"match": map[string]any{
+						"any": ids,
+					},
+				},
+			},
+		}
 	}
 	return map[string]any{
 		"should": []map[string]any{

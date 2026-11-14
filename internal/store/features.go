@@ -528,8 +528,22 @@ func (s *Store) SearchWithOptions(ctx context.Context, queryVec []float32, opts 
 
 	s.mu.RLock()
 	qc := s.qdrant
-	hasAdvancedFilters := opts.Category != "" || opts.Tag != "" || opts.Author != "" || opts.YearMin > 0 || opts.CodeOnly
+	matchingBooks := s.matchingBookIDsLocked(opts)
 	s.mu.RUnlock()
+
+	if matchingBooks != nil && len(matchingBooks) == 0 {
+		return nil
+	}
+
+	qdrantBookFilter := opts.BookFilter
+	if len(matchingBooks) > 0 {
+		ids := make([]string, 0, len(matchingBooks))
+		for id := range matchingBooks {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		qdrantBookFilter = "book_ids:" + strings.Join(ids, ",")
+	}
 
 	candidatePoolSize := opts.TopK * 6
 	if opts.MaxPerBook == 1 || opts.CodeOnly {
@@ -539,16 +553,22 @@ func (s *Store) SearchWithOptions(ctx context.Context, queryVec []float32, opts 
 		candidatePoolSize = 30
 	}
 
-	if qc != nil && !hasAdvancedFilters {
-		qPoints, err := qc.QueryHybrid(ctx, opts.Query, normQueryVec, opts.Mode, opts.BookFilter, candidatePoolSize)
+	if qc != nil {
+		qPoints, err := qc.QueryHybrid(ctx, opts.Query, normQueryVec, opts.Mode, qdrantBookFilter, candidatePoolSize)
 		if err == nil && len(qPoints) > 0 {
+			matchSource := "qdrant:sparse_idf"
+			if opts.Mode == "hybrid" && len(normQueryVec) > 0 {
+				matchSource = "qdrant:dense+sparse_rrf"
+			} else if opts.Mode == "semantic" && len(normQueryVec) > 0 {
+				matchSource = "qdrant:semantic"
+			}
 			childResults := make([]SearchResult, 0, len(qPoints))
 			for _, pt := range qPoints {
 				childResults = append(childResults, SearchResult{
 					Chunk:        pt.Payload,
 					ParentID:     pt.Payload.ParentID,
 					Score:        pt.Score,
-					MatchSources: []string{"qdrant:" + opts.Mode},
+					MatchSources: []string{matchSource},
 				})
 			}
 			return s.promoteToParentsWithOptions(childResults, opts)
@@ -659,10 +679,14 @@ func (s *Store) promoteToParentsWithOptions(childHits []SearchResult, opts Searc
 		return nil
 	}
 
+	matchingBooks := s.matchingBookIDsLocked(opts)
 	byParent := make(map[string]*SearchResult)
 	order := make([]string, 0, len(childHits))
 
 	for _, hit := range childHits {
+		if matchingBooks != nil && !matchingBooks[hit.Chunk.BookID] {
+			continue
+		}
 		pID := hit.Chunk.ParentID
 		if pID == "" {
 			pID = hit.Chunk.ID
@@ -676,12 +700,14 @@ func (s *Store) promoteToParentsWithOptions(childHits []SearchResult, opts Searc
 			} else if parentSecSQL, okSQL := s.getParentFromSQLite(pID); okSQL && parentSecSQL.Content != "" {
 				parentText = parentSecSQL.Content
 			}
+			hasCode := hit.Chunk.HasCode || scoreCodeDensity(parentText) > 0
 			if opts.CodeOnly && scoreCodeDensity(parentText) <= 0 {
 				continue
 			}
 			copied := hit
 			copied.ParentID = pID
 			copied.ParentText = parentText
+			copied.Chunk.HasCode = hasCode
 			copied.ChildHits = 1
 			byParent[pID] = &copied
 			order = append(order, pID)

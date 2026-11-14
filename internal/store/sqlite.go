@@ -518,6 +518,7 @@ func (s *Store) getParentFromSQLite(parentID string) (epub.ParentSection, bool) 
 	if err != nil {
 		return epub.ParentSection{}, false
 	}
+	p.HasCode = scoreCodeDensity(p.Content) > 0
 	return p, true
 }
 

@@ -48,10 +48,14 @@
       qdrantPill.textContent = st.qdrant_online ? "Qdrant: Online (Hybrid RRF)" : "Qdrant: Offline (Local Fallback)";
       qdrantPill.className = st.qdrant_online ? "pill pill-ok" : "pill pill-warn";
 
+      const providerLabel =
+        (st.ai_provider || (st.config && st.config.ai_provider) || "ollama") === "openai"
+          ? "OpenAI"
+          : "Ollama";
       const ollamaPill = document.getElementById("ollama-pill");
       ollamaPill.textContent = st.ollama_online
-        ? "Ollama: " + st.config.chat_model
-        : "Ollama: Offline";
+        ? providerLabel + ": " + st.config.chat_model
+        : providerLabel + ": Offline";
       ollamaPill.className = st.ollama_online ? "pill pill-ok" : "pill pill-warn";
 
       const statsPill = document.getElementById("stats-pill");
@@ -76,7 +80,10 @@
     document.getElementById("cfg-books-dir").value = cfg.books_dir || "";
     document.getElementById("cfg-resolved-dir").textContent = "Resolved path: " + (resolvedDir || "");
     document.getElementById("cfg-qdrant-url").value = cfg.qdrant_url || "";
+    document.getElementById("cfg-ai-provider").value = cfg.ai_provider || "ollama";
     document.getElementById("cfg-ollama-url").value = cfg.ollama_url || "";
+    document.getElementById("cfg-openai-url").value = cfg.openai_url || "https://api.openai.com/v1";
+    document.getElementById("cfg-openai-key").value = cfg.openai_api_key || "";
     document.getElementById("cfg-embed-model").value = cfg.embedding_model || "";
     document.getElementById("cfg-chat-model").value = cfg.chat_model || "";
     document.getElementById("cfg-parent-size").value = String(cfg.parent_chunk_size || 3200);
@@ -593,7 +600,10 @@
       const payload = {
         books_dir: document.getElementById("cfg-books-dir").value.trim(),
         qdrant_url: document.getElementById("cfg-qdrant-url").value.trim(),
+        ai_provider: document.getElementById("cfg-ai-provider").value,
         ollama_url: document.getElementById("cfg-ollama-url").value.trim(),
+        openai_url: document.getElementById("cfg-openai-url").value.trim(),
+        openai_api_key: document.getElementById("cfg-openai-key").value.trim(),
         embedding_model: document.getElementById("cfg-embed-model").value.trim(),
         chat_model: document.getElementById("cfg-chat-model").value.trim(),
         parent_chunk_size: parseInt(document.getElementById("cfg-parent-size").value, 10) || 3200,

@@ -126,17 +126,34 @@
             <input id="cfg-qdrant-url" type="url" class="input-control" required>
           </div>
           <div class="form-group">
-            <label for="cfg-ollama-url">Ollama Server URL</label>
-            <input id="cfg-ollama-url" type="url" class="input-control" required>
+            <label for="cfg-ai-provider">AI Protocol Provider</label>
+            <select id="cfg-ai-provider" class="input-control">
+              <option value="ollama">Ollama (Local)</option>
+              <option value="openai">OpenAI Compatible (/v1)</option>
+            </select>
           </div>
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label for="cfg-embed-model">Embedding Model (Ollama)</label>
+            <label for="cfg-ollama-url">Ollama Server URL</label>
+            <input id="cfg-ollama-url" type="url" class="input-control" required>
+          </div>
+          <div class="form-group">
+            <label for="cfg-openai-url">OpenAI-Compatible Base URL</label>
+            <input id="cfg-openai-url" type="url" class="input-control" placeholder="https://api.openai.com/v1">
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="cfg-openai-key">OpenAI-Compatible API Key</label>
+          <input id="cfg-openai-key" type="password" class="input-control" autocomplete="off" placeholder="sk-... (optional for local OpenAI-compatible servers)">
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="cfg-embed-model">Embedding Model</label>
             <input id="cfg-embed-model" type="text" class="input-control" required>
           </div>
           <div class="form-group">
-            <label for="cfg-chat-model">Chat LLM Model (Ollama)</label>
+            <label for="cfg-chat-model">Chat LLM Model</label>
             <input id="cfg-chat-model" type="text" class="input-control" required>
           </div>
         </div>

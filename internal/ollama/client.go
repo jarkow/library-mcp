@@ -8,42 +8,92 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"library-mcp/internal/domain"
 )
 
-// Client communicates with a local Ollama server.
+// Client communicates with a local Ollama server or an OpenAI-compatible API endpoint.
 type Client struct {
 	BaseURL    string
+	Protocol   string // "ollama" (default) or "openai"
+	APIKey     string
 	HTTPClient *http.Client
 }
 
-// ModelInfo describes an installed Ollama model.
+// ModelInfo describes an available AI model.
 type ModelInfo = domain.ModelInfo
 
-// ChatMessage represents a single message in an Ollama conversation.
+// ChatMessage represents a single message in a conversation.
 type ChatMessage = domain.ChatMessage
 
 var _ domain.AIGateway = (*Client)(nil)
 
 // NewClient creates a new Ollama API client with sensible timeouts.
 func NewClient(baseURL string) *Client {
+	return NewClientWithConfig(baseURL, "ollama", "")
+}
+
+// NewClientWithConfig creates an AI gateway client configured for either "ollama" or "openai" protocol.
+func NewClientWithConfig(baseURL, protocol, apiKey string) *Client {
+	cleanURL := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	proto := strings.ToLower(strings.TrimSpace(protocol))
+	if proto == "" {
+		if strings.HasSuffix(cleanURL, "/v1") {
+			proto = "openai"
+		} else {
+			proto = "ollama"
+		}
+	}
 	return &Client{
-		BaseURL: strings.TrimRight(baseURL, "/"),
+		BaseURL:  cleanURL,
+		Protocol: proto,
+		APIKey:   strings.TrimSpace(apiKey),
 		HTTPClient: &http.Client{
 			Timeout: 180 * time.Second,
 		},
 	}
 }
 
-// ListModels returns the list of models currently installed in Ollama.
+func (c *Client) isOpenAI() bool {
+	return strings.EqualFold(strings.TrimSpace(c.Protocol), "openai")
+}
+
+func (c *Client) openAIEndpoint(path string) string {
+	base := strings.TrimRight(c.BaseURL, "/")
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if u, err := url.Parse(base); err == nil {
+		cleanPath := strings.TrimRight(u.Path, "/")
+		if cleanPath == "" {
+			return base + "/v1" + path
+		}
+	}
+	return base + path
+}
+
+func (c *Client) setHeaders(req *http.Request, hasBody bool) {
+	if hasBody {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	}
+}
+
+// ListModels returns the list of models currently available on the configured AI provider.
 func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
+	if c.isOpenAI() {
+		return c.listModelsOpenAI(ctx)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/api/tags", nil)
 	if err != nil {
 		return nil, err
 	}
+	c.setHeaders(req, false)
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -63,10 +113,48 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	return payload.Models, nil
 }
 
+func (c *Client) listModelsOpenAI(ctx context.Context) ([]ModelInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.openAIEndpoint("/models"), nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setHeaders(req, false)
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("openai /models returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
+
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 10*1024*1024)).Decode(&payload); err != nil {
+		return nil, err
+	}
+	models := make([]ModelInfo, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		if strings.TrimSpace(item.ID) == "" {
+			continue
+		}
+		models = append(models, ModelInfo{Name: item.ID})
+	}
+	return models, nil
+}
+
 // EmbedBatch generates float32 vector embeddings for a batch of input texts.
 func (c *Client) EmbedBatch(ctx context.Context, model string, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
+	}
+	if c.isOpenAI() {
+		return c.embedBatchOpenAI(ctx, model, texts)
 	}
 	reqBody := map[string]any{
 		"model": model,
@@ -81,7 +169,7 @@ func (c *Client) EmbedBatch(ctx context.Context, model string, texts []string) (
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	c.setHeaders(req, true)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -113,6 +201,71 @@ func (c *Client) EmbedBatch(ctx context.Context, model string, texts []string) (
 	return out, nil
 }
 
+func (c *Client) embedBatchOpenAI(ctx context.Context, model string, texts []string) ([][]float32, error) {
+	reqBody := map[string]any{
+		"model": model,
+		"input": texts,
+	}
+	b, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.openAIEndpoint("/embeddings"), bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	c.setHeaders(req, true)
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("openai /embeddings returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
+
+	var result struct {
+		Data []struct {
+			Index     int       `json:"index"`
+			Embedding []float32 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 50*1024*1024)).Decode(&result); err != nil {
+		return nil, err
+	}
+	if len(result.Data) != len(texts) {
+		return nil, fmt.Errorf("openai /embeddings returned %d embeddings for %d inputs", len(result.Data), len(texts))
+	}
+
+	out := make([][]float32, len(texts))
+	used := make([]bool, len(texts))
+	sequentialFallback := false
+	for _, item := range result.Data {
+		if len(item.Embedding) == 0 {
+			return nil, errors.New("empty embedding returned from openai endpoint")
+		}
+		if item.Index < 0 || item.Index >= len(texts) || used[item.Index] {
+			sequentialFallback = true
+			break
+		}
+		out[item.Index] = item.Embedding
+		used[item.Index] = true
+	}
+	if sequentialFallback {
+		for i, item := range result.Data {
+			if len(item.Embedding) == 0 {
+				return nil, errors.New("empty embedding returned from openai endpoint")
+			}
+			out[i] = item.Embedding
+		}
+	}
+	return out, nil
+}
+
 func (c *Client) embedSingleFallback(ctx context.Context, model, prompt string) ([]float32, error) {
 	reqBody := map[string]any{
 		"model":  model,
@@ -126,7 +279,7 @@ func (c *Client) embedSingleFallback(ctx context.Context, model, prompt string) 
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	c.setHeaders(req, true)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -151,8 +304,11 @@ func (c *Client) embedSingleFallback(ctx context.Context, model, prompt string) 
 	return result.Embedding, nil
 }
 
-// Chat sends a non-streaming chat completion request to Ollama.
+// Chat sends a non-streaming chat completion request to Ollama or an OpenAI-compatible API.
 func (c *Client) Chat(ctx context.Context, model string, messages []ChatMessage) (string, error) {
+	if c.isOpenAI() {
+		return c.chatOpenAI(ctx, model, messages)
+	}
 	reqBody := map[string]any{
 		"model":    model,
 		"messages": messages,
@@ -171,7 +327,7 @@ func (c *Client) Chat(ctx context.Context, model string, messages []ChatMessage)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	c.setHeaders(req, true)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -191,4 +347,46 @@ func (c *Client) Chat(ctx context.Context, model string, messages []ChatMessage)
 		return "", err
 	}
 	return result.Message.Content, nil
+}
+
+func (c *Client) chatOpenAI(ctx context.Context, model string, messages []ChatMessage) (string, error) {
+	reqBody := map[string]any{
+		"model":       model,
+		"messages":    messages,
+		"temperature": 0.15,
+	}
+	b, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.openAIEndpoint("/chat/completions"), bytes.NewReader(b))
+	if err != nil {
+		return "", err
+	}
+	c.setHeaders(req, true)
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("openai /chat/completions returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
+
+	var result struct {
+		Choices []struct {
+			Message ChatMessage `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 20*1024*1024)).Decode(&result); err != nil {
+		return "", err
+	}
+	if len(result.Choices) == 0 {
+		return "", errors.New("openai /chat/completions returned no choices")
+	}
+	return result.Choices[0].Message.Content, nil
 }

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,10 +49,17 @@ func main() {
 	}
 	defer st.Close()
 	engine := rag.NewEngine(cfg, st)
+	var composeDirs []string
+	if absCfg, absErr := filepath.Abs(cfgPath); absErr == nil {
+		composeDirs = append(composeDirs, filepath.Dir(absCfg))
+	}
+	composeDirs = append(composeDirs, filepath.Dir(cfg.ResolvedDataDir()))
+	engine.EnableQdrantAutoStart(composeDirs...)
 	ctx := context.Background()
 
 	switch subcmd {
 	case "ingest":
+		_ = engine.EnsureQdrantRunning(ctx)
 		fs := flag.NewFlagSet("ingest", flag.ExitOnError)
 		dirFlag := fs.String("dir", "", "Books directory to scan (overrides config.json books_dir)")
 		forceFlag := fs.Bool("force", false, "Re-index books even if SHA-256 hash is unchanged")
@@ -451,17 +459,18 @@ func main() {
 			removed.ID, removed.Title, removed.Author, removed.ChapterCount, removed.ParentCount, removed.ChunkCount)
 
 	case "status":
+		_ = engine.EnsureQdrantRunning(ctx)
 		ov := engine.CatalogOverview()
 		bCount, chCount, pCount, ckCount, vCount := ov.Books, ov.Chapters, ov.Parents, ov.Chunks, ov.Vectors
 		cats, tags := ov.Categories, ov.Tags
 		qdrantOK := engine.CheckQdrant(ctx)
-		models, ollamaErr := engine.ListOllamaModels(ctx)
+		models, aiErr := engine.ListOllamaModels(ctx)
 		fmt.Println("Library MCP Status:")
 		fmt.Printf("  Configured Books Dir : %s\n", cfg.BooksDir)
 		fmt.Printf("  Resolved OS Path     : %s\n", cfg.ResolvedBooksDir())
 		fmt.Printf("  Qdrant Server        : %s (Online: %v)\n", cfg.QdrantURL, qdrantOK)
 		fmt.Printf("  Qdrant Dashboard     : %s/dashboard\n", cfg.QdrantURL)
-		fmt.Printf("  Ollama Server        : %s (Online: %v, Models: %d)\n", cfg.OllamaURL, ollamaErr == nil, len(models))
+		fmt.Printf("  AI Provider          : %s (%s | Online: %v, Models: %d)\n", cfg.EffectiveAIProvider(), cfg.EffectiveAIURL(), aiErr == nil, len(models))
 		fmt.Printf("  Embedding / Chat LLM : %s / %s\n", cfg.EmbeddingModel, cfg.ChatModel)
 		fmt.Printf("  Catalog Totals       : %d books, %d chapters, %d parent sections, %d child chunks (%d vectors)\n",
 			bCount, chCount, pCount, ckCount, vCount)
@@ -469,6 +478,7 @@ func main() {
 		fmt.Printf("  Saved Notes          : %d notes | Duplicate Groups: %d\n", ov.NotesCount, ov.DuplicatesCount)
 
 	case "sync":
+		_ = engine.EnsureQdrantRunning(ctx)
 		fmt.Printf("Syncing local catalog chunks to Qdrant (%s, collection: %s)...\n", cfg.QdrantURL, cfg.QdrantCollection)
 		if err := engine.SyncToQdrant(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "Qdrant sync failed: %v\n", err)
@@ -482,9 +492,12 @@ func main() {
 		fs := flag.NewFlagSet("config", flag.ExitOnError)
 		booksDir := fs.String("books-dir", "", "Set default books directory (e.g. H:\\Books or ~/Books)")
 		qdrantURL := fs.String("qdrant-url", "", "Set Qdrant server URL")
+		aiProvider := fs.String("ai-provider", "", "Set AI provider protocol: ollama or openai")
 		ollamaURL := fs.String("ollama-url", "", "Set Ollama server URL")
-		embedModel := fs.String("embed-model", "", "Set Ollama embedding model")
-		chatModel := fs.String("chat-model", "", "Set Ollama chat model")
+		openaiURL := fs.String("openai-url", "", "Set OpenAI-compatible API base URL (e.g. https://api.openai.com/v1)")
+		openaiAPIKey := fs.String("openai-api-key", "", "Set API key for OpenAI-compatible provider")
+		embedModel := fs.String("embed-model", "", "Set embedding model name")
+		chatModel := fs.String("chat-model", "", "Set chat LLM model name")
 		_ = fs.Parse(args)
 
 		updated := false
@@ -496,8 +509,20 @@ func main() {
 			cfg.QdrantURL = *qdrantURL
 			updated = true
 		}
+		if *aiProvider != "" {
+			cfg.AIProvider = *aiProvider
+			updated = true
+		}
 		if *ollamaURL != "" {
 			cfg.OllamaURL = *ollamaURL
+			updated = true
+		}
+		if *openaiURL != "" {
+			cfg.OpenAIURL = *openaiURL
+			updated = true
+		}
+		if *openaiAPIKey != "" {
+			cfg.OpenAIAPIKey = *openaiAPIKey
 			updated = true
 		}
 		if *embedModel != "" {
@@ -515,10 +540,18 @@ func main() {
 			}
 			fmt.Println("Configuration updated and saved.")
 		}
+		redacted := cfg.Redacted()
+		apiKeyStatus := "(not set)"
+		if redacted.OpenAIAPIKey != "" {
+			apiKeyStatus = redacted.OpenAIAPIKey
+		}
 		fmt.Printf("Current Config (%s):\n", cfgPath)
 		fmt.Printf("  books_dir        : %s (resolves to: %s)\n", cfg.BooksDir, cfg.ResolvedBooksDir())
 		fmt.Printf("  qdrant_url       : %s (collection: %s)\n", cfg.QdrantURL, cfg.QdrantCollection)
+		fmt.Printf("  ai_provider      : %s\n", cfg.EffectiveAIProvider())
 		fmt.Printf("  ollama_url       : %s\n", cfg.OllamaURL)
+		fmt.Printf("  openai_url       : %s\n", cfg.OpenAIURL)
+		fmt.Printf("  openai_api_key   : %s\n", apiKeyStatus)
 		fmt.Printf("  embedding_model  : %s\n", cfg.EmbeddingModel)
 		fmt.Printf("  chat_model       : %s\n", cfg.ChatModel)
 		fmt.Printf("  parent_chunk_size: %d\n", cfg.ParentChunkSize)
@@ -531,6 +564,7 @@ func main() {
 		cfg.Port = *portFlag
 		cfg.Sanitize()
 		engine.UpdateConfig(cfg)
+		_ = engine.EnsureQdrantRunning(ctx)
 
 		srv := web.NewServer(engine, cfgPath)
 		if err := srv.ListenAndServe(); err != nil {
@@ -539,6 +573,9 @@ func main() {
 		}
 
 	case "mcp":
+		go func() {
+			_ = engine.EnsureQdrantRunning(ctx)
+		}()
 		mcpSrv := mcp.NewServer(engine)
 		if err := mcpSrv.ServeStdio(ctx, os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)

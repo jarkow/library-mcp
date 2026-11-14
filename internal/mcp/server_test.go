@@ -226,6 +226,27 @@ func TestToolsReturnStructuredJSON(t *testing.T) {
 	if firstRes["book_id"] != "book-1" || firstRes["parent_id"] != "parent-1" {
 		t.Fatalf("unexpected search result item: %#v", firstRes)
 	}
+	if _, hasContent := firstRes["content"]; hasContent {
+		t.Fatalf("search_books should not return full 'content', got %#v", firstRes["content"])
+	}
+	if snippet, _ := firstRes["snippet"].(string); snippet == "" {
+		t.Fatalf("search_books should return non-empty 'snippet', got %#v", firstRes)
+	}
+
+	// 2a. get_section
+	secPayload, isErr := callToolJSON(t, srv, "get_section", map[string]any{"parent_id": "parent-1"})
+	if isErr {
+		t.Fatalf("get_section failed: %v", secPayload)
+	}
+	if secPayload["parent_id"] != "parent-1" || secPayload["section_title"] != "Boundaries and Ports" {
+		t.Fatalf("unexpected get_section payload: %#v", secPayload)
+	}
+	if secContent, _ := secPayload["content"].(string); !strings.Contains(secContent, "type Port interface") {
+		t.Fatalf("expected full section content with code block, got %q", secContent)
+	}
+	if hasCode, _ := secPayload["has_code"].(bool); !hasCode {
+		t.Fatalf("expected has_code=true on get_section payload, got %#v", secPayload["has_code"])
+	}
 
 	// 2b. extract_code_examples & compare_books_on_topic
 	codePayload, isErr := callToolJSON(t, srv, "extract_code_examples", map[string]any{"query": "inward dependencies"})
@@ -323,5 +344,136 @@ func TestToolsReturnStructuredJSON(t *testing.T) {
 		if err := json.Unmarshal([]byte(entry["text"].(string)), &obj); err != nil {
 			t.Fatalf("resource %s did not return valid JSON: %v", uri, err)
 		}
+	}
+}
+
+type stubEmbedAI struct{}
+
+func (stubEmbedAI) ListModels(context.Context) ([]domain.ModelInfo, error) {
+	return nil, nil
+}
+
+func (stubEmbedAI) EmbedBatch(_ context.Context, _ string, texts []string) ([][]float32, error) {
+	vecs := make([][]float32, len(texts))
+	for i := range texts {
+		vecs[i] = []float32{0.6, 0.8}
+	}
+	return vecs, nil
+}
+
+func (stubEmbedAI) Chat(context.Context, string, []domain.ChatMessage) (string, error) {
+	return "", errors.New("unused")
+}
+
+type qdrantQueryCall struct {
+	queryText  string
+	hasDense   bool
+	mode       string
+	bookFilter string
+	limit      int
+}
+
+type recordingVectorIndex struct {
+	calls  []qdrantQueryCall
+	points []domain.ScoredPoint
+}
+
+func (r *recordingVectorIndex) HealthCheck(context.Context) error            { return nil }
+func (r *recordingVectorIndex) EnsureCollection(context.Context, int) error  { return nil }
+func (r *recordingVectorIndex) DeleteByBookID(context.Context, string) error { return nil }
+func (r *recordingVectorIndex) UpsertChunks(context.Context, []domain.ParsedChunk, [][]float32) error {
+	return nil
+}
+func (r *recordingVectorIndex) QueryHybrid(_ context.Context, queryText string, denseVec []float32, mode string, bookID string, limit int) ([]domain.ScoredPoint, error) {
+	r.calls = append(r.calls, qdrantQueryCall{
+		queryText:  queryText,
+		hasDense:   len(denseVec) > 0,
+		mode:       mode,
+		bookFilter: bookID,
+		limit:      limit,
+	})
+	return r.points, nil
+}
+
+func TestFilteredAndCodeSearchAlwaysUseQdrant(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	recVec := &recordingVectorIndex{
+		points: []domain.ScoredPoint{
+			{
+				ID:    "00000000-0000-0000-0000-000000000001",
+				Score: 0.91,
+				Payload: domain.ParsedChunk{
+					ID:           "chunk-1",
+					PointUUID:    "00000000-0000-0000-0000-000000000001",
+					ParentID:     "parent-1",
+					BookID:       "book-1",
+					ChapterID:    "chap-1",
+					BookTitle:    "Clean Architecture",
+					Author:       "Robert C. Martin",
+					ChapterTitle: "The Dependency Rule",
+					SectionTitle: "Boundaries and Ports",
+					ChunkIndex:   1,
+					HasCode:      true,
+					Text:         "Source code dependencies must point only inward toward higher-level policies.",
+				},
+			},
+		},
+	}
+
+	st, err := store.Open(dataDir, recVec)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = st.Close()
+	})
+	seedTestBook(t, st)
+
+	cfg := config.Default()
+	cfg.DataDir = dataDir
+	eng := rag.NewEngineWithPorts(cfg, st, stubEmbedAI{}, recVec, stubMeta{})
+	srv := NewServer(eng)
+
+	// Filtered search with category, tag, year_min, and code_only must still route through Qdrant.
+	searchPayload, isErr := callToolJSON(t, srv, "search_books", map[string]any{
+		"query":     "ports and boundaries",
+		"category":  "Software Architecture",
+		"tag":       "hexagonal-architecture",
+		"year_min":  2017,
+		"code_only": true,
+	})
+	if isErr {
+		t.Fatalf("filtered search_books failed: %v", searchPayload)
+	}
+	if len(recVec.calls) != 1 {
+		t.Fatalf("expected Qdrant QueryHybrid to be called once for filtered search, got %d", len(recVec.calls))
+	}
+	call := recVec.calls[0]
+	if !call.hasDense || call.mode != "hybrid" || call.bookFilter != "book_ids:book-1" {
+		t.Fatalf("unexpected Qdrant query call: %+v", call)
+	}
+	results := searchPayload["results"].([]any)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 search result, got %d", len(results))
+	}
+	hit := results[0].(map[string]any)
+	if _, hasContent := hit["content"]; hasContent {
+		t.Fatalf("search_books should not include 'content'")
+	}
+	sources := hit["match_sources"].([]any)
+	if len(sources) != 1 || sources[0] != "qdrant:dense+sparse_rrf" {
+		t.Fatalf("expected qdrant:dense+sparse_rrf match source, got %#v", sources)
+	}
+
+	// extract_code_examples must also route through Qdrant.
+	codePayload, isErr := callToolJSON(t, srv, "extract_code_examples", map[string]any{
+		"query":    "port interface",
+		"category": "Software Architecture",
+	})
+	if isErr {
+		t.Fatalf("extract_code_examples failed: %v", codePayload)
+	}
+	if len(recVec.calls) != 2 {
+		t.Fatalf("expected Qdrant QueryHybrid to be called twice, got %d", len(recVec.calls))
 	}
 }

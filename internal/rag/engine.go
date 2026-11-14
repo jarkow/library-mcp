@@ -58,11 +58,15 @@ func (e *Engine) RecentWatcherEvents() []WatcherEvent {
 	return append([]WatcherEvent(nil), e.watcherEvents...)
 }
 
-// NewEngine creates a new RAG Engine wired with the default Qdrant, Ollama, and Web Metadata adapters.
+func newAIClient(cfg *config.Config) domain.AIGateway {
+	return ollama.NewClientWithConfig(cfg.EffectiveAIURL(), cfg.EffectiveAIProvider(), cfg.OpenAIAPIKey)
+}
+
+// NewEngine creates a new RAG Engine wired with the default Qdrant, AI Gateway (Ollama/OpenAI), and Web Metadata adapters.
 func NewEngine(cfg *config.Config, st *store.Store) *Engine {
 	qc := qdrant.NewClient(cfg.QdrantURL, cfg.QdrantCollection)
 	st.SetQdrantClient(qc)
-	return NewEngineWithPorts(cfg, st, ollama.NewClient(cfg.OllamaURL), qc, metadata.NewEnricher())
+	return NewEngineWithPorts(cfg, st, newAIClient(cfg), qc, metadata.NewEnricher())
 }
 
 // NewEngineWithPorts creates a new RAG Engine injected with custom Hexagonal Driven Port implementations.
@@ -88,15 +92,42 @@ func (e *Engine) SetMetadataGateway(meta domain.MetadataGateway) {
 	e.enricher = meta
 }
 
-// UpdateConfig updates the engine configuration and refreshes the Ollama and Qdrant clients.
+// UpdateConfig updates the engine configuration and refreshes the AI Gateway and Qdrant clients.
 func (e *Engine) UpdateConfig(cfg *config.Config) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	cfg.Sanitize()
 	e.cfg = cfg
-	e.ollama = ollama.NewClient(cfg.OllamaURL)
-	e.qdrant = qdrant.NewClient(cfg.QdrantURL, cfg.QdrantCollection)
-	e.store.SetQdrantClient(e.qdrant)
+	e.ollama = newAIClient(cfg)
+	e.ollamaOfflineUntil = time.Time{}
+	newQC := qdrant.NewClient(cfg.QdrantURL, cfg.QdrantCollection)
+	if oldQC, ok := e.qdrant.(*qdrant.Client); ok && oldQC != nil {
+		newQC.CopyAutoStartFrom(oldQC)
+	}
+	e.qdrant = newQC
+	e.store.SetQdrantClient(newQC)
+}
+
+// EnableQdrantAutoStart enables automatic local Qdrant Docker container startup
+// when the configured VectorIndex is a *qdrant.Client.
+func (e *Engine) EnableQdrantAutoStart(dirs ...string) {
+	e.mu.RLock()
+	vec := e.qdrant
+	e.mu.RUnlock()
+	if qc, ok := vec.(*qdrant.Client); ok && qc != nil {
+		qc.EnableAutoStart(dirs...)
+	}
+}
+
+// EnsureQdrantRunning checks Qdrant health and starts the local Docker container if needed.
+func (e *Engine) EnsureQdrantRunning(ctx context.Context) error {
+	e.mu.RLock()
+	vec := e.qdrant
+	e.mu.RUnlock()
+	if qc, ok := vec.(*qdrant.Client); ok && qc != nil {
+		return qc.EnsureContainerRunning(ctx)
+	}
+	return nil
 }
 
 // GetConfig returns a copy of the current configuration.
@@ -405,7 +436,7 @@ func (e *Engine) embedChunksWithBatching(ctx context.Context, chunks []epub.Pars
 			e.mu.Lock()
 			e.ollamaOfflineUntil = time.Now().Add(60 * time.Second)
 			e.mu.Unlock()
-			log.Printf("Note: Ollama embedding (%s) unavailable, indexing sparse vectors & BM25: %v", cfg.EmbeddingModel, err)
+			log.Printf("Note: %s embedding (%s) unavailable, indexing sparse vectors & BM25: %v", cfg.EffectiveAIProvider(), cfg.EmbeddingModel, err)
 			return nil, false
 		}
 		allVecs = append(allVecs, vecs...)
@@ -500,8 +531,8 @@ Follow these rules strictly:
 	})
 	if err != nil {
 		answer = fmt.Sprintf(
-			"⚠️ Could not reach local Ollama chat model (%q at %s): %v\n\nHowever, Qdrant Parent-Child retrieval found %d relevant parent sections from your books (shown in the Sources panel).",
-			cfg.ChatModel, cfg.OllamaURL, err, len(sources),
+			"⚠️ Could not reach %s chat model (%q at %s): %v\n\nHowever, Qdrant Parent-Child retrieval found %d relevant parent sections from your books (shown in the Sources panel).",
+			cfg.EffectiveAIProvider(), cfg.ChatModel, cfg.EffectiveAIURL(), err, len(sources),
 		)
 	}
 

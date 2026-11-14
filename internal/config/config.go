@@ -21,13 +21,16 @@ var (
 	wslMountRe     = regexp.MustCompile(`^/mnt/([a-zA-Z])(?:/(.*))?$`)
 )
 
-// Config holds the runtime configuration for Smart Library (Go + Qdrant + Ollama).
+// Config holds the runtime configuration for Smart Library (Go + Qdrant + Ollama/OpenAI).
 type Config struct {
 	BooksDir         string `json:"books_dir"`
 	DataDir          string `json:"data_dir"`
 	QdrantURL        string `json:"qdrant_url"`
 	QdrantCollection string `json:"qdrant_collection"`
+	AIProvider       string `json:"ai_provider,omitempty"`
 	OllamaURL        string `json:"ollama_url"`
+	OpenAIURL        string `json:"openai_url,omitempty"`
+	OpenAIAPIKey     string `json:"openai_api_key,omitempty"`
 	EmbeddingModel   string `json:"embedding_model"`
 	ChatModel        string `json:"chat_model"`
 	ParentChunkSize  int    `json:"parent_chunk_size"`
@@ -59,7 +62,9 @@ func Default() *Config {
 		DataDir:          filepath.Join(cwd, "data"),
 		QdrantURL:        "http://127.0.0.1:6333",
 		QdrantCollection: "smart_library_chunks",
+		AIProvider:       "ollama",
 		OllamaURL:        "http://127.0.0.1:11434",
+		OpenAIURL:        "https://api.openai.com/v1",
 		EmbeddingModel:   "bge-m3",
 		ChatModel:        "qwen2.5-coder:14b",
 		ParentChunkSize:  3200,
@@ -227,6 +232,15 @@ func Load(configPath string) (*Config, error) {
 	if v := firstEnv("LIBRARY_MCP_OLLAMA_URL", "SMART_LIBRARY_OLLAMA_URL"); v != "" {
 		cfg.OllamaURL = v
 	}
+	if v := firstEnv("LIBRARY_MCP_AI_PROVIDER", "SMART_LIBRARY_AI_PROVIDER"); v != "" {
+		cfg.AIProvider = v
+	}
+	if v := firstEnv("LIBRARY_MCP_OPENAI_URL", "SMART_LIBRARY_OPENAI_URL", "OPENAI_BASE_URL"); v != "" {
+		cfg.OpenAIURL = v
+	}
+	if v := firstEnv("LIBRARY_MCP_OPENAI_API_KEY", "SMART_LIBRARY_OPENAI_API_KEY", "OPENAI_API_KEY"); v != "" {
+		cfg.OpenAIAPIKey = v
+	}
 	if v := firstEnv("LIBRARY_MCP_EMBED_MODEL", "SMART_LIBRARY_EMBED_MODEL"); v != "" {
 		cfg.EmbeddingModel = v
 	}
@@ -296,11 +310,53 @@ func (c *Config) Sanitize() {
 	} else {
 		c.OllamaURL = "http://127.0.0.1:11434"
 	}
+	provider := strings.ToLower(strings.TrimSpace(c.AIProvider))
+	if provider != "openai" && provider != "ollama" {
+		provider = "ollama"
+	}
+	c.AIProvider = provider
+	if validated, err := ValidateEndpointURL(c.OpenAIURL); err == nil {
+		c.OpenAIURL = validated
+	} else {
+		c.OpenAIURL = "https://api.openai.com/v1"
+	}
+	c.OpenAIAPIKey = strings.TrimSpace(c.OpenAIAPIKey)
 	if strings.TrimSpace(c.QdrantCollection) == "" {
 		c.QdrantCollection = "smart_library_chunks"
 	}
 	// Strictly bind to localhost
 	c.Host = "127.0.0.1"
+}
+
+// EffectiveAIProvider returns the normalized active AI protocol ("ollama" or "openai").
+func (c Config) EffectiveAIProvider() string {
+	if strings.EqualFold(strings.TrimSpace(c.AIProvider), "openai") {
+		return "openai"
+	}
+	return "ollama"
+}
+
+// EffectiveAIURL returns the endpoint base URL for the active AI provider.
+func (c Config) EffectiveAIURL() string {
+	if c.EffectiveAIProvider() == "openai" {
+		if strings.TrimSpace(c.OpenAIURL) != "" {
+			return strings.TrimRight(strings.TrimSpace(c.OpenAIURL), "/")
+		}
+		if strings.TrimSpace(c.OllamaURL) != "" {
+			return strings.TrimRight(strings.TrimSpace(c.OllamaURL), "/")
+		}
+		return "https://api.openai.com/v1"
+	}
+	return strings.TrimRight(strings.TrimSpace(c.OllamaURL), "/")
+}
+
+// Redacted returns a shallow copy of Config with API keys masked for status/UI responses.
+func (c Config) Redacted() Config {
+	copyCfg := c
+	if copyCfg.OpenAIAPIKey != "" {
+		copyCfg.OpenAIAPIKey = "********"
+	}
+	return copyCfg
 }
 
 // ResolvedBooksDir returns the OS-resolved books directory path.

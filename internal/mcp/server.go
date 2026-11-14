@@ -222,7 +222,7 @@ func (s *Server) toolDefinitions() []map[string]any {
 	return []map[string]any{
 		{
 			"name":        "search_books",
-			"description": "Search the user's technical book library using Hybrid RRF (Dense + Sparse BM25), Parent-Child Hierarchical Retrieval, and MMR cross-book diversity. Supports filtering by book, category, tag, author, minimum year, per-book cap, and code-only sections.",
+			"description": "Search the user's technical book library using Qdrant Hybrid RRF (Dense + Sparse BM25), Parent-Child Hierarchical Retrieval, and MMR cross-book diversity. Returns lightweight search hits with metadata, short snippets, and locator IDs (parent_id, chapter_id); use get_section or get_chapter to read full text. Supports filtering by book, category, tag, author, minimum year, per-book cap, and code-only sections.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -333,6 +333,20 @@ func (s *Server) toolDefinitions() []map[string]any {
 					},
 				},
 				"required": []string{"query"},
+			},
+		},
+		{
+			"name":        "get_section",
+			"description": "Retrieve the complete text (~3,200 chars, including full code blocks and tables) of a specific book parent section by parent_id.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"parent_id": map[string]any{
+						"type":        "string",
+						"description": "The parent_id returned by search_books, get_book_toc, or search_chapters.",
+					},
+				},
+				"required": []string{"parent_id"},
 			},
 		},
 		{
@@ -573,7 +587,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		}
 
 		results := s.engine.SearchWithOptions(ctx, opts)
-		items := s.toMCPSearchResults(results)
+		items := s.toMCPSearchHits(results)
 		return toJSON(map[string]any{
 			"query":   query,
 			"count":   len(items),
@@ -632,6 +646,29 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 			"query":    query,
 			"count":    len(hits),
 			"chapters": hits,
+		})
+
+	case "get_section":
+		parentID := stringArg(args, "parent_id")
+		if parentID == "" {
+			return toJSONError("'parent_id' parameter is required.")
+		}
+		sec, ok := s.engine.GetParentSection(parentID)
+		if !ok {
+			return toJSONError(fmt.Sprintf("Section %q not found.", parentID))
+		}
+		return toJSON(map[string]any{
+			"parent_id":     sec.ID,
+			"book_id":       sec.BookID,
+			"book_title":    sec.BookTitle,
+			"author":        sec.Author,
+			"chapter_id":    sec.ChapterID,
+			"chapter_title": sec.ChapterTitle,
+			"section_title": sec.SectionTitle,
+			"parent_index":  sec.ParentIndex,
+			"has_code":      sec.HasCode,
+			"char_length":   len(sec.Content),
+			"content":       sec.Content,
 		})
 
 	case "get_chapter":
@@ -1086,7 +1123,7 @@ type mcpBookItem struct {
 	IndexedAt      string   `json:"indexed_at,omitempty"`
 }
 
-type mcpSearchResult struct {
+type mcpSearchHitBase struct {
 	Rank         int      `json:"rank"`
 	Score        float64  `json:"score"`
 	BM25Score    float64  `json:"bm25_score,omitempty"`
@@ -1103,7 +1140,16 @@ type mcpSearchResult struct {
 	ParentID     string   `json:"parent_id"`
 	SectionTitle string   `json:"section_title"`
 	HasCode      bool     `json:"has_code"`
-	Content      string   `json:"content"`
+}
+
+type mcpSearchHit struct {
+	mcpSearchHitBase
+	Snippet string `json:"snippet"`
+}
+
+type mcpSearchResult struct {
+	mcpSearchHitBase
+	Content string `json:"content"`
 }
 
 func toJSON(v any) (string, bool) {
@@ -1160,44 +1206,77 @@ func toMCPBookItems(books []domain.BookRecord) []mcpBookItem {
 	return items
 }
 
+func truncateSnippet(text string, maxRunes int) string {
+	collapsed := strings.Join(strings.Fields(text), " ")
+	if maxRunes <= 0 {
+		return collapsed
+	}
+	runes := []rune(collapsed)
+	if len(runes) <= maxRunes {
+		return collapsed
+	}
+	return strings.TrimSpace(string(runes[:maxRunes])) + "..."
+}
+
+func (s *Server) buildSearchHitBase(rank int, res domain.SearchResult) mcpSearchHitBase {
+	ck := res.Chunk
+	var category string
+	tags := []string{}
+	if bookRec, hasBook := s.engine.GetBookRecord(ck.BookID); hasBook {
+		category = bookRec.Category
+		if len(bookRec.Tags) > 0 {
+			tags = append([]string(nil), bookRec.Tags...)
+		}
+	}
+	sources := []string{}
+	if len(res.MatchSources) > 0 {
+		sources = append([]string(nil), res.MatchSources...)
+	}
+	return mcpSearchHitBase{
+		Rank:         rank,
+		Score:        res.Score,
+		BM25Score:    res.BM25Score,
+		VectorScore:  res.VectorScore,
+		ChildHits:    res.ChildHits,
+		MatchSources: sources,
+		BookID:       ck.BookID,
+		BookTitle:    ck.BookTitle,
+		Author:       ck.Author,
+		Category:     category,
+		Tags:         tags,
+		ChapterID:    ck.ChapterID,
+		ChapterTitle: ck.ChapterTitle,
+		ParentID:     res.ParentID,
+		SectionTitle: ck.SectionTitle,
+		HasCode:      ck.HasCode,
+	}
+}
+
+func (s *Server) toMCPSearchHits(results []domain.SearchResult) []mcpSearchHit {
+	items := make([]mcpSearchHit, 0, len(results))
+	for i, res := range results {
+		snippetSource := res.Chunk.Text
+		if strings.TrimSpace(snippetSource) == "" {
+			snippetSource = res.ParentText
+		}
+		items = append(items, mcpSearchHit{
+			mcpSearchHitBase: s.buildSearchHitBase(i+1, res),
+			Snippet:          truncateSnippet(snippetSource, 240),
+		})
+	}
+	return items
+}
+
 func (s *Server) toMCPSearchResults(results []domain.SearchResult) []mcpSearchResult {
 	items := make([]mcpSearchResult, 0, len(results))
 	for i, res := range results {
-		ck := res.Chunk
 		parentContent := res.ParentText
 		if parentContent == "" {
-			parentContent = ck.Text
-		}
-		var category string
-		tags := []string{}
-		if bookRec, hasBook := s.engine.GetBookRecord(ck.BookID); hasBook {
-			category = bookRec.Category
-			if len(bookRec.Tags) > 0 {
-				tags = append([]string(nil), bookRec.Tags...)
-			}
-		}
-		sources := []string{}
-		if len(res.MatchSources) > 0 {
-			sources = append([]string(nil), res.MatchSources...)
+			parentContent = res.Chunk.Text
 		}
 		items = append(items, mcpSearchResult{
-			Rank:         i + 1,
-			Score:        res.Score,
-			BM25Score:    res.BM25Score,
-			VectorScore:  res.VectorScore,
-			ChildHits:    res.ChildHits,
-			MatchSources: sources,
-			BookID:       ck.BookID,
-			BookTitle:    ck.BookTitle,
-			Author:       ck.Author,
-			Category:     category,
-			Tags:         tags,
-			ChapterID:    ck.ChapterID,
-			ChapterTitle: ck.ChapterTitle,
-			ParentID:     res.ParentID,
-			SectionTitle: ck.SectionTitle,
-			HasCode:      ck.HasCode,
-			Content:      parentContent,
+			mcpSearchHitBase: s.buildSearchHitBase(i+1, res),
+			Content:          parentContent,
 		})
 	}
 	return items

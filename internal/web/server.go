@@ -252,7 +252,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	_, dirErr := os.Stat(resolvedBooksPath)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"config":             cfg,
+		"config":             cfg.Redacted(),
 		"resolved_books_dir": resolvedBooksPath,
 		"books_dir_exists":   dirErr == nil,
 		"books_count":        overview.Books,
@@ -265,6 +265,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"watcher_events":     s.engine.RecentWatcherEvents(),
 		"qdrant_online":      qdrantOK,
 		"qdrant_dashboard":   strings.TrimRight(cfg.QdrantURL, "/") + "/dashboard",
+		"ai_provider":        cfg.EffectiveAIProvider(),
 		"ollama_online":      ollamaErr == nil,
 		"ollama_models":      modelNames,
 		"retrieval_strategy": "Parent-Child Hierarchical + Qdrant Hybrid RRF + MMR Cross-Book Diversity",
@@ -685,8 +686,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		curr := s.engine.GetConfig()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"config":             curr.Redacted(),
+			"resolved_books_dir": curr.ResolvedBooksDir(),
+		})
+		return
+	}
 	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "POST required.")
+		writeJSONError(w, http.StatusMethodNotAllowed, "GET or POST required.")
 		return
 	}
 	var incoming config.Config
@@ -704,10 +713,21 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			curr.QdrantURL = u
 		}
 	}
+	if strings.TrimSpace(incoming.AIProvider) != "" {
+		curr.AIProvider = strings.TrimSpace(incoming.AIProvider)
+	}
 	if strings.TrimSpace(incoming.OllamaURL) != "" {
 		if u, err := config.ValidateEndpointURL(incoming.OllamaURL); err == nil {
 			curr.OllamaURL = u
 		}
+	}
+	if strings.TrimSpace(incoming.OpenAIURL) != "" {
+		if u, err := config.ValidateEndpointURL(incoming.OpenAIURL); err == nil {
+			curr.OpenAIURL = u
+		}
+	}
+	if apiKey := strings.TrimSpace(incoming.OpenAIAPIKey); apiKey != "" && apiKey != "********" {
+		curr.OpenAIAPIKey = apiKey
 	}
 	if strings.TrimSpace(incoming.EmbeddingModel) != "" {
 		curr.EmbeddingModel = strings.TrimSpace(incoming.EmbeddingModel)
@@ -734,7 +754,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	s.engine.UpdateConfig(&curr)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"config":             curr,
+		"config":             curr.Redacted(),
 		"resolved_books_dir": curr.ResolvedBooksDir(),
 	})
 }
